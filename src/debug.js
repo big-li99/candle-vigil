@@ -2,6 +2,7 @@
 import { createFx, createAct, painterFor, hex } from "../vendor/pixelfx/src/core/index.js";
 import { get as getAsset } from "./assets.js";
 import { W, H } from "./frame.js";
+import { NUMBER_FILL } from "./systems/combat.js";
 
 const params = new URLSearchParams(location.search);
 const errors = [];
@@ -88,6 +89,7 @@ export function createPlayground() {
         mana: 0,
         enemies: [],
         casting: false,
+        cooldowns: [],
         fps: stats ? stats.fps : 0,
       };
     },
@@ -97,11 +99,12 @@ export function createPlayground() {
 /** Install window.__game, __report (~2.5 s after load) and the ?autotest run. */
 export function initDebug({ game, playground, renderer, stats, isPaused, togglePause }) {
   const view = playground ?? game;
+  const live = playground ? null : game; // the field's actions, or nothing in the fx playground
 
   window.__game = {
     snapshot: () => view.snapshot(stats),
-    spawn: () => 0,
-    cast: () => false,
+    spawn: (type = "slime", n = 1, x) => (live ? live.spawn(type, n, x) : 0),
+    cast: (i = 0) => (live ? live.cast(i) : false),
     setWave: (n) => game.setWave(n),
     skipUpgrade: () => false,
     god: (on) => {
@@ -137,6 +140,14 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
       canvas: [renderer.canvas.width, renderer.canvas.height],
       pixels: { lit, topLeft },
       cssScale: renderer.getScale(),
+      stats: {
+        hits: stats.hits,
+        kills: stats.kills,
+        freezes: stats.freezes,
+        combo: stats.combo,
+        bestCombo: stats.bestCombo,
+        damageNumberPixels: stats.damageNumberPixels || 0,
+      },
       errorSamples: errors.slice(0, 5),
       warningSamples: warnings.slice(0, 5),
     };
@@ -148,31 +159,109 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
     if (params.has("autotest")) window.__report.autotest = { result: "pending", reason: "" };
   }, 2500);
 
-  if (params.has("autotest")) {
-    // A scripted session: leave the title, then measure the running field.
-    setTimeout(() => {
-      if (game.scene === "title") game.enterField();
-    }, 700);
+  if (params.has("autotest")) runAutotest({ game, playground, renderer, stats, report });
 
-    setTimeout(() => {
-      const r = report();
-      const reasons = [];
-      if (r.consoleErrors !== 0) reasons.push(`${r.consoleErrors} console error(s)`);
-      if (!(r.fps > 55)) reasons.push(`fps ${r.fps} <= 55`);
-      if (r.canvas[0] !== W || r.canvas[1] !== H) reasons.push(`canvas ${r.canvas.join("x")} != ${W}x${H}`);
-      if (r.cssScale !== Math.floor(r.cssScale) || r.cssScale < 1) reasons.push(`non-integer css scale ${r.cssScale}`);
-      if (r.scene !== "field") reasons.push(`scene ${r.scene} != field`);
-      if (r.pixels.topLeft <= 0) reasons.push("no HUD pixels in top-left band");
+  return { report };
+}
 
-      const pass = reasons.length === 0;
-      document.body.dataset.autotest = pass ? "pass" : "fail";
-      document.body.dataset.autotestReason = pass ? "ok" : reasons.join("; ");
-      if (window.__report) {
-        window.__report.autotest = {
-          result: pass ? "pass" : "fail",
-          reason: pass ? "ok" : reasons.join("; "),
-        };
+/**
+ * The scripted M1 session: leave the title, put one slime inside sword reach, keep casting while the game
+ * allows it, and read the result back at the end. Every assertion is a measured number: counters the game
+ * incremented, the world buffer's own pixels, the canvas transform.
+ */
+function runAutotest({ game, playground, renderer, stats, report }) {
+  if (playground) return;
+
+  setTimeout(() => {
+    if (game.scene === "title") game.enterField();
+  }, 400);
+
+  // A slime well inside sword reach (56 + 140 = 196), so the fight does not depend on walking distance.
+  setTimeout(() => {
+    if (game.scene === "field") game.spawn("slime", 1, 180);
+  }, 500);
+
+  // Press "1" whenever the game will take it; a refused cast costs nothing.
+  const caster = setInterval(() => {
+    if (game.scene === "field") game.cast(0);
+  }, 150);
+
+  // Damage numbers are measured, not assumed: count the digits' own fill color inside the box combat
+  // reported for the number it just drew. The world buffer is read when the renderer exposes it (the light
+  // buffer is added later at composite time, so the colour there is exactly what p.text wrote); the canvas
+  // is the fallback, with a tolerance because glow is added on top of it.
+  const fillR = NUMBER_FILL & 255;
+  const fillG = (NUMBER_FILL >>> 8) & 255;
+  const fillB = (NUMBER_FILL >>> 16) & 255;
+  const fillU = NUMBER_FILL >>> 0; // the colour buffer is Uint32 and the constant is a signed int32
+  const probe = setInterval(() => {
+    const combat = game.combat;
+    if (!combat || typeof combat.numberBoxes !== "function") return;
+    const boxes = combat.numberBoxes();
+    if (!boxes.length) return;
+    const world = renderer.frame;
+    const canvasPx = world ? null : renderer.readPixels().data;
+    let n = 0;
+    for (const b of boxes) {
+      const x1 = Math.max(0, b.x);
+      const x2 = Math.min(W, b.x + b.w);
+      const y1 = Math.max(0, b.y);
+      const y2 = Math.min(H, b.y + b.h);
+      for (let y = y1; y < y2; y++) {
+        for (let x = x1; x < x2; x++) {
+          if (world) {
+            const wx = x - (world.ox | 0);
+            const wy = y - (world.oy | 0);
+            if (wx >= 0 && wy >= 0 && wx < world.w && wy < world.h && world.color[wy * world.w + wx] === fillU) n++;
+          } else {
+            const j = (y * W + x) * 4;
+            if (Math.abs(canvasPx[j] - fillR) < 8 && Math.abs(canvasPx[j + 1] - fillG) < 8 && Math.abs(canvasPx[j + 2] - fillB) < 8) n++;
+          }
+        }
       }
-    }, 3400);
-  }
+    }
+    if (n > (stats.damageNumberPixels || 0)) stats.damageNumberPixels = n;
+  }, 80);
+
+  setTimeout(() => {
+    clearInterval(caster);
+    clearInterval(probe);
+
+    const r = report();
+    const reasons = [];
+    if (r.consoleErrors !== 0) reasons.push(`${r.consoleErrors} console error(s)`);
+    if (!(r.fps > 55)) reasons.push(`fps ${r.fps} <= 55`);
+    if (r.canvas[0] !== W || r.canvas[1] !== H) reasons.push(`canvas ${r.canvas.join("x")} != ${W}x${H}`);
+    if (r.cssScale !== Math.floor(r.cssScale) || r.cssScale < 1) reasons.push(`non-integer css scale ${r.cssScale}`);
+    if (r.scene !== "field") reasons.push(`scene ${r.scene} != field`);
+    if (r.pixels.topLeft <= 0) reasons.push("no HUD pixels in top-left band");
+    // M1 feel assertions
+    if (!(stats.kills >= 1)) reasons.push(`kills ${stats.kills} < 1`);
+    if (!(stats.hits >= 1)) reasons.push(`hits ${stats.hits} < 1`);
+    if (!(stats.freezes >= 1)) reasons.push(`freezes ${stats.freezes} < 1`);
+    if (!(stats.damageNumberPixels > 0)) reasons.push("no damage-number pixels on the canvas");
+    // the shake must have fully released: renderer.setShake(0, 0) leaves no transform behind
+    if (renderer.canvas.style.transform !== "") reasons.push(`canvas transform "${renderer.canvas.style.transform}" not cleared`);
+
+    const pass = reasons.length === 0;
+    document.body.dataset.autotest = pass ? "pass" : "fail";
+    document.body.dataset.autotestReason = pass ? "ok" : reasons.join("; ");
+    if (window.__report) {
+      window.__report.consoleErrors = errors.length;
+      window.__report.fps = stats.fps;
+      window.__report.stats = {
+        hits: stats.hits,
+        kills: stats.kills,
+        freezes: stats.freezes,
+        combo: stats.combo,
+        bestCombo: stats.bestCombo,
+        damageNumberPixels: stats.damageNumberPixels || 0,
+      };
+      window.__report.candle = game.snapshot(stats).candle;
+      window.__report.autotest = {
+        result: pass ? "pass" : "fail",
+        reason: pass ? "ok" : reasons.join("; "),
+      };
+    }
+  }, 9000);
 }

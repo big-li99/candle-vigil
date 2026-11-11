@@ -11,9 +11,9 @@ const MAX_STEPS = 4;
 const canvas = document.getElementById("game");
 const renderer = createRenderer(canvas);
 const input = createInput(canvas);
-const game = createGame({ input });
+const stats = { fps: 0, hits: 0, kills: 0, freezes: 0, combo: 0, bestCombo: 0 };
+const game = createGame({ input, renderer, stats });
 const playground = createPlayground();
-const stats = { fps: 0, hits: 0, kills: 0, freezes: 0 };
 
 let paused = false;
 let acc = 0;
@@ -22,7 +22,15 @@ let fpsFrames = 0;
 let fpsAt = performance.now();
 
 function togglePause() {
-  paused = !paused;
+  if (paused) paused = false;
+  else pauseNow();
+}
+
+/** Pausing mid-shake would leave the canvas offset for good, so the pause always releases the shake. */
+function pauseNow() {
+  if (paused) return;
+  paused = true;
+  renderer.setShake(0, 0);
 }
 
 function step(dt) {
@@ -34,7 +42,7 @@ function step(dt) {
 
   // P pauses the field or the fx playground; on the title any key simply starts the game.
   if ((playground || game.scene === "field") && input.pressed("pause")) {
-    paused = true;
+    pauseNow();
     input.clearEdges();
     return;
   }
@@ -90,10 +98,10 @@ function tick(now) {
 }
 
 window.addEventListener("blur", () => {
-  if (!paused && (playground || game.scene === "field")) paused = true;
+  if (playground || game.scene === "field") pauseNow();
 });
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden && !paused && (playground || game.scene === "field")) paused = true;
+  if (document.hidden && (playground || game.scene === "field")) pauseNow();
 });
 window.addEventListener("focus", () => {
   last = performance.now();
