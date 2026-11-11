@@ -144,6 +144,7 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
         hits: stats.hits,
         kills: stats.kills,
         freezes: stats.freezes,
+        interrupts: stats.interrupts || 0,
         combo: stats.combo,
         bestCombo: stats.bestCombo,
         damageNumberPixels: stats.damageNumberPixels || 0,
@@ -165,12 +166,25 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
 }
 
 /**
- * The scripted M1 session: leave the title, put one slime inside sword reach, keep casting while the game
- * allows it, and read the result back at the end. Every assertion is a measured number: counters the game
- * incremented, the world buffer's own pixels, the canvas transform.
+ * The scripted M1.5 session, in two measured acts:
+ *   1. one slime inside sword reach is killed by one cast (one number, one spark, kills + 1);
+ *   2. a slime bites during a hammer wind-up, the cast is interrupted, and the very next cast still lands
+ *      (the armor rule) — the exact deadlock M1 shipped with.
+ * Every assertion is a measured number: counters the game incremented, the world buffer's own pixels, the
+ * canvas transform.
  */
 function runAutotest({ game, playground, renderer, stats, report }) {
   if (playground) return;
+
+  const killsBefore = stats.kills;
+  const interruptsBefore = stats.interrupts || 0;
+  let nearKilled = false;
+  let guardSpawned = false;
+  let hammerCast = false;
+  let sawInterrupt = false;
+  let hitsAfterInterrupt = 0;
+  let followUpCast = false;
+  let followUpLanded = false;
 
   setTimeout(() => {
     if (game.scene === "title") game.enterField();
@@ -178,13 +192,44 @@ function runAutotest({ game, playground, renderer, stats, report }) {
 
   // A slime well inside sword reach (56 + 140 = 196), so the fight does not depend on walking distance.
   setTimeout(() => {
-    if (game.scene === "field") game.spawn("slime", 1, 180);
+    if (game.scene === "field") game.spawn("slime", 1, 160);
   }, 500);
 
-  // Press "1" whenever the game will take it; a refused cast costs nothing.
+  // Press "1" until the near slime dies; a refused cast costs nothing.
   const caster = setInterval(() => {
-    if (game.scene === "field") game.cast(0);
+    if (game.scene === "field" && !nearKilled) game.cast(0);
   }, 150);
+
+  // Once the near kill is measured, put one slime on the guard line. Its first bite is due 0.6 s later;
+  // the director casts the slow hammer just before it, so the bite lands inside the wind-up, then casts the
+  // fast slash as soon as the interrupt counter moves.
+  setTimeout(() => {
+    if (game.scene !== "field") return;
+    game.spawn("slime", 1, 124);
+    guardSpawned = true;
+  }, 2500);
+
+  const director = setInterval(() => {
+    if (game.scene !== "field") return;
+    if (!nearKilled && stats.kills > killsBefore) nearKilled = true;
+
+    if (guardSpawned && nearKilled && !hammerCast) {
+      for (const e of game.enemies) {
+        if (e.dead) continue;
+        // biteIn is the front slime's own countdown, so this is deterministic rather than a guessed delay
+        if (e.biteIn < 0.1 && game.player.phase === "idle" && game.cast(1)) {
+          hammerCast = true;
+          break;
+        }
+      }
+    }
+    if (hammerCast && !sawInterrupt && stats.interrupts > interruptsBefore) {
+      sawInterrupt = true;
+      hitsAfterInterrupt = stats.hits;
+    }
+    if (sawInterrupt && !followUpCast && game.cast(0)) followUpCast = true;
+    if (followUpCast && !followUpLanded && stats.hits > hitsAfterInterrupt) followUpLanded = true;
+  }, 16);
 
   // Damage numbers are measured, not assumed: count the digits' own fill color inside the box combat
   // reported for the number it just drew. The world buffer is read when the renderer exposes it (the light
@@ -225,6 +270,7 @@ function runAutotest({ game, playground, renderer, stats, report }) {
 
   setTimeout(() => {
     clearInterval(caster);
+    clearInterval(director);
     clearInterval(probe);
 
     const r = report();
@@ -235,11 +281,14 @@ function runAutotest({ game, playground, renderer, stats, report }) {
     if (r.cssScale !== Math.floor(r.cssScale) || r.cssScale < 1) reasons.push(`non-integer css scale ${r.cssScale}`);
     if (r.scene !== "field") reasons.push(`scene ${r.scene} != field`);
     if (r.pixels.topLeft <= 0) reasons.push("no HUD pixels in top-left band");
-    // M1 feel assertions
+    // M1.5 feel assertions
+    if (!nearKilled) reasons.push("near target was not killed (kills did not increase)");
     if (!(stats.kills >= 1)) reasons.push(`kills ${stats.kills} < 1`);
     if (!(stats.hits >= 1)) reasons.push(`hits ${stats.hits} < 1`);
     if (!(stats.freezes >= 1)) reasons.push(`freezes ${stats.freezes} < 1`);
     if (!(stats.damageNumberPixels > 0)) reasons.push("no damage-number pixels on the canvas");
+    if (!sawInterrupt) reasons.push("no bite interrupted a wind-up (interrupt path not exercised)");
+    if (sawInterrupt && !followUpLanded) reasons.push("cast after bite interrupt did not land (stats.hits did not increase)");
     // the shake must have fully released: renderer.setShake(0, 0) leaves no transform behind
     if (renderer.canvas.style.transform !== "") reasons.push(`canvas transform "${renderer.canvas.style.transform}" not cleared`);
 
@@ -253,6 +302,7 @@ function runAutotest({ game, playground, renderer, stats, report }) {
         hits: stats.hits,
         kills: stats.kills,
         freezes: stats.freezes,
+        interrupts: stats.interrupts || 0,
         combo: stats.combo,
         bestCombo: stats.bestCombo,
         damageNumberPixels: stats.damageNumberPixels || 0,
@@ -261,7 +311,9 @@ function runAutotest({ game, playground, renderer, stats, report }) {
       window.__report.autotest = {
         result: pass ? "pass" : "fail",
         reason: pass ? "ok" : reasons.join("; "),
+        nearTargetKilled: nearKilled,
+        castAfterInterrupt: followUpLanded,
       };
     }
-  }, 9000);
+  }, 6500);
 }

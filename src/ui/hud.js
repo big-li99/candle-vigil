@@ -123,16 +123,19 @@ export function drawHud(frame, state, run = {}) {
   p.text(emberLabel, 6 + plateW - 6, 8, C.warm, { font: "mini", align: "right" });
 
   const low = state.candle < 30;
-  p.text("CANDLE", 12, 18, low ? C.danger : C.warm, { font: "mini" });
+  // a bite makes the bar blink red for a moment; that is the "you were bitten but not interrupted" cue
+  const bitten = (state.biteFlash ?? 0) > 0;
+  p.text("CANDLE", 12, 18, bitten || low ? C.danger : C.warm, { font: "mini" });
   const candleW = p.measure("CANDLE", { font: "mini" })[0];
   const barX = 12 + candleW + 5;
   const barW = Math.max(20, plateW - (barX - 6) - 26);
   const barY = 18;
   const barH = 5;
+  if (bitten) p.rect(barX - 1, barY - 1, barW + 2, barH + 2, C.dangerBar);
   p.rect(barX, barY, barW, barH, C.warmEmpty);
   const candleFill = Math.max(0, Math.min(1, state.candle / state.maxCandle));
-  p.rect(barX, barY, Math.round(barW * candleFill), barH, low ? C.dangerBar : C.warmBar);
-  p.text(String(Math.round(state.candle)), 6 + plateW - 6, 18, low ? C.danger : C.warm, { font: "mini", align: "right" });
+  p.rect(barX, barY, Math.round(barW * candleFill), barH, bitten || low ? C.dangerBar : C.warmBar);
+  p.text(String(Math.round(state.candle)), 6 + plateW - 6, 18, bitten || low ? C.danger : C.warm, { font: "mini", align: "right" });
 
   // --- bottom row: four slots (1–2 bound) + mana, on the floor strip -----------------
   clearLight(p, 0, SLOTS_Y, W, H - SLOTS_Y);

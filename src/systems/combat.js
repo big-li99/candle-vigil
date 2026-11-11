@@ -44,19 +44,35 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
 
   /**
    * Resolve one hit: damage the target, stop the world, shake the screen, flash white, spark, number, combo.
-   * freeze/shake/amp come straight from actTiming(fx).hits; a bite passes none and still gets the 0.05 s floor.
+   * freeze/shake/amp come straight from actTiming(fx).hits; a bite passes none.
+   *
+   * `fxImpacts: false` is the one small switch for a hit that is not an impact (enemy bites): it still damages
+   * the target and shakes the screen, but leaves no spark, number, white flash, freeze, hit stat or combo.
    */
-  function hit({ x = 0, y = 0, damage = 0, knock = 0, target = null, freeze: fz = 0, shake = 0, amp = 0, count = true } = {}) {
+  function hit({
+    x = 0,
+    y = 0,
+    damage = 0,
+    knock = 0,
+    target = null,
+    freeze: fz = 0,
+    shake = 0,
+    amp = 0,
+    count = true,
+    fxImpacts = true,
+  } = {}) {
     target?.hurt?.(damage, knock);
 
-    freeze = Math.max(freeze, Math.min(HIT_FREEZE_MAX, Math.max(HIT_FREEZE_MIN, fz)));
-    stats.hits++;
-    stats.freezes++;
     if (shake > 0) {
       shakeDur = shake;
       shakeT = shake;
       shakeAmp = Math.max(1, amp);
     }
+    if (!fxImpacts) return; // a bite's feedback is the shake it just set, the candle flash and the flinch
+
+    freeze = Math.max(freeze, Math.min(HIT_FREEZE_MAX, Math.max(HIT_FREEZE_MIN, fz)));
+    stats.hits++;
+    stats.freezes++;
     flashT = FLASH_TIME;
     effect("impacts/hit-spark", x, y);
     // the number starts above the impact so it never sits on top of the enemy's own hit flash

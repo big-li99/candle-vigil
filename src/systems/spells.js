@@ -11,7 +11,11 @@ export const SPELLS = [
     fx: swordSlash,
     cost: 10,
     cd: 0.6,
-    damage: 12,
+    // DESIGN §2.6: two cuts of 15 = 30, exactly one slime. The vendored act exposes a single hit window
+    // (actTiming(swordSlash).hits has one entry at t=0.06), so both cuts land in that window and combat
+    // resolves them as one impact: one number (30), one spark, one combo step — the M1.5 acceptance.
+    damage: 15,
+    strikes: 2,
     knock: 6,
     reach: 140,
     thumbT: 0.10, // the frame the HUD thumbnail is rendered from: the crescent at full sweep
