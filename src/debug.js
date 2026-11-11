@@ -109,6 +109,10 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
     pickCard: (i = 0) => (live ? live.pickCard(i) : false),
     skipUpgrade: () => (live ? live.skipUpgrade() : false),
     block: () => (live ? live.block() : false),
+    /** M2c automation: take candle directly and walk the real failure flow (god mode does not stop this hook). */
+    damageCandle: (n = 100) => (live ? live.damageCandle(n) : 0),
+    /** M2c automation: kill every living body and drop the rest of this wave's spawn queue. */
+    killAll: () => (live ? live.killAll() : 0),
     god: (on) => {
       game.state.god = !!on;
       return game.state.god;
@@ -260,6 +264,40 @@ function runAutotest({ game, playground, renderer, stats, report }) {
     blockSecondRefused: false,
     blockCd: 0,
     blockEffects: 0,
+    // M2c: boss, breath, failure/ending flows, persisted best
+    bossSpawned: false,
+    bossHp: null,
+    bossMax: null,
+    bossDamaged: false,
+    bossHpAfterBolt: null,
+    bossSummoned: false,
+    bossSummonCount: 0,
+    bossSummonOnce: false,
+    bossTelegraph: false,
+    breathUnblocked: false,
+    breathCandleDrop: 0,
+    breathBlockPressed: false,
+    breathBlocked: false,
+    breathBlockCandleHeld: false,
+    breathBossRecoil: false,
+    failImmediate: false,
+    failReady: false,
+    failBest: null,
+    restarted: false,
+    restartModsClean: false,
+    restartCandle: null,
+    restartMana: null,
+    restartEnemies: -1,
+    wave10Boss: false,
+    bossKilled: false,
+    bossKillCount: 0,
+    bossEmbers: 0,
+    endingReady: false,
+    returnedTitle: false,
+    bestAfterWin: null,
+    bestAtTitle: null,
+    bestStored: false,
+    reentered: false,
   };
   let finished = false;
   let hard = null;
@@ -369,8 +407,8 @@ function runAutotest({ game, playground, renderer, stats, report }) {
   }
 
   hard = setTimeout(() => {
-    finish([`autotest timed out after 110 s (scene ${game.scene}, phase ${game.player.phase})`]);
-  }, 110000);
+    finish([`autotest timed out after 160 s (scene ${game.scene}, phase ${game.player.phase})`]);
+  }, 160000);
 
   (async () => {
     try {
@@ -610,6 +648,136 @@ function runAutotest({ game, playground, renderer, stats, report }) {
       flags.blockEffects = game.combat.effectCount();
       flags.blockSecondRefused = game.block() === false;
 
+      // --- M2c: the boss appears, takes real damage, and calls three slimes exactly once --------
+      await waitFor(() => game.player.phase === "idle", 5000);
+      game.state.god = false;
+      game.state.spawnPaused = true;
+      game.setWave(5);
+      game.state.spawnPaused = false; // let the wave queue put its boss on the field
+      const bossUp = await waitFor(() => {
+        const b = snap().boss;
+        return !!b && b.hp === 200 && b.max === 200;
+      }, 3000);
+      flags.bossSpawned = bossUp;
+      flags.bossHp = snap().boss?.hp ?? null;
+      flags.bossMax = snap().boss?.max ?? null;
+
+      // a real bolt takes real hp off it (the boss is the only body on the field). This cast is not part of
+      // the spell cost/cooldown measurement above — the focus card is already applied by now.
+      game.player.cooldowns.fill(0);
+      game.state.mana = 100;
+      if (game.player.phase === "idle") game.cast(3);
+      flags.bossDamaged = await waitFor(() => {
+        const b = snap().boss;
+        return !!b && b.hp < 200;
+      }, 4500);
+      if (game.player.phase === "cast") game.player.cancel("autotest");
+      await waitFor(() => game.player.phase === "idle", 2500);
+      flags.bossHpAfterBolt = snap().boss?.hp ?? null;
+
+      // cross half: three slimes, and a second hit must not call a second trio
+      const bossFirst = game.enemies.find((e) => !e.dead && e.type === "boss");
+      if (bossFirst) bossFirst.hurt(40, 0);
+      flags.bossSummoned = await waitFor(() => alive("slime").length >= 3, 2000);
+      flags.bossSummonCount = alive("slime").length;
+      if (bossFirst && !bossFirst.dead) bossFirst.hurt(10, 0);
+      await sleep(150);
+      flags.bossSummonOnce = alive("slime").length === 3;
+
+      // --- M2c: the tell is visible and brightens; unblocked costs 15, blocked costs nothing ----
+      game.state.spawnPaused = true;
+      game.setWave(5); // clear the field
+      game.spawn("boss", 1, 124); // at the guard line, so the breath can reach the watchman
+      game.state.candle = 100;
+      game.state.mana = 100;
+      game.player.cooldowns.fill(0);
+      game.state.god = false;
+
+      flags.bossTelegraph = await waitFor(() => (snap().boss?.telegraph ?? 0) > 0, 9000);
+      const breathCandle0 = snap().candle;
+      flags.breathUnblocked = await waitFor(() => snap().candle <= breathCandle0 - 14.99, 3000);
+      flags.breathCandleDrop = Math.round((breathCandle0 - snap().candle) * 100) / 100;
+
+      const breathCandle1 = snap().candle;
+      const breathBlocks0 = stats.blocks || 0;
+      flags.breathBlockPressed = await waitFor(() => {
+        const b = snap().boss;
+        if (!(b && b.telegraph > 0 && b.telegraph < 0.28)) return false;
+        return game.block();
+      }, 9000);
+      let recoilX = 124;
+      flags.breathBlocked = await waitFor(
+        () => {
+          recoilX = Math.max(recoilX, snap().boss?.x ?? 124);
+          return (stats.blocks || 0) > breathBlocks0;
+        },
+        3000,
+        () => {
+          recoilX = Math.max(recoilX, snap().boss?.x ?? 124);
+        },
+      );
+      flags.breathBlockCandleHeld = snap().candle === breathCandle1;
+      flags.breathBossRecoil = recoilX >= 129.5; // 6 px back, sampled before it walks in again
+
+      // --- M2c: candle 0 -> iris -> result page -> a complete restart --------------------------
+      game.state.spawnPaused = true;
+      game.setWave(5);
+      game.state.god = false;
+      game.state.candle = 100;
+      game.damageCandle(100);
+      flags.failImmediate = snap().state === "over" && snap().candle === 0;
+      flags.failBest = snap().best;
+      flags.failReady = await waitFor(() => snap().result?.ready === true, 4500);
+      window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyX" }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyX" }));
+      flags.restarted = await waitFor(() => {
+        const s = snap();
+        return s.state === "playing" && s.wave === 1 && s.candle === 100 && s.mana === 100 && s.enemies.length === 0;
+      }, 3000);
+      const fresh = snap();
+      flags.restartCandle = fresh.candle;
+      flags.restartMana = fresh.mana;
+      flags.restartEnemies = fresh.enemies.length;
+      flags.restartModsClean =
+        fresh.mods.cdMult === 1 &&
+        fresh.mods.slashMult === 1 &&
+        fresh.mods.hammerStun === 0 &&
+        fresh.mods.candleCapBonus === 0 &&
+        fresh.mods.blockWindowBonus === 0 &&
+        fresh.mods.healMult === 1 &&
+        fresh.cooldowns.every((v) => v === 0) &&
+        fresh.block.cd === 0 &&
+        (stats.combo || 0) === 0;
+
+      // --- M2c: the tenth wave ends the night, the record persists, and any key goes to the title --
+      game.state.spawnPaused = false;
+      game.setWave(10);
+      flags.wave10Boss = await waitFor(() => !!snap().boss, 3000);
+      const bossKills0 = stats.killsByType.boss ?? 0;
+      const embers0 = snap().embers;
+      game.killAll(); // clears the boss and the 20 s reinforcement queue -> the wave is cleared
+      flags.bossKilled = await waitFor(() => snap().state === "ending", 3500);
+      flags.bossKillCount = (stats.killsByType.boss ?? 0) - bossKills0;
+      flags.bossEmbers = snap().embers - embers0;
+      flags.bestAfterWin = snap().best;
+      flags.bestStored = (() => {
+        try {
+          const b = JSON.parse(localStorage.getItem("candle-vigil:best"));
+          return !!b && b.wave === 10 && typeof b.time === "number" && b.time > 0;
+        } catch {
+          return false;
+        }
+      })();
+      flags.endingReady = await waitFor(() => snap().result?.ready === true, 5000);
+      window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyX" }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyX" }));
+      flags.returnedTitle = await waitFor(() => snap().scene === "title", 3000);
+      flags.bestAtTitle = snap().best;
+      // a fresh key on the title starts a clean run, so the final report is taken on the live field
+      window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyX" }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyX" }));
+      flags.reentered = await waitFor(() => snap().scene === "field" && snap().wave === 1, 3000);
+
       // --- final measured verdict ----------------------------------------------------
       const r = report();
       const reasons = [];
@@ -699,7 +867,47 @@ function runAutotest({ game, playground, renderer, stats, report }) {
       if (!flags.blockNoInterrupt) reasons.push("the blocked bite counted as an interrupt");
       if (!(flags.blockCd > 0)) reasons.push("the block cooldown did not start");
       if (!flags.blockSecondRefused) reasons.push("a second block inside the cooldown was accepted");
+
+      // M2c: boss, breath, the two run ends, and the persisted best
+      if (!flags.bossSpawned || flags.bossHp !== 200 || flags.bossMax !== 200) {
+        reasons.push(`boss did not spawn at 200 hp (spawned ${flags.bossSpawned}, hp ${flags.bossHp}/${flags.bossMax})`);
+      }
+      if (!flags.bossDamaged) reasons.push(`the boss did not lose hp to a real bolt (hp ${flags.bossHpAfterBolt})`);
+      if (!flags.bossSummoned || flags.bossSummonCount !== 3) {
+        reasons.push(`half hp called ${flags.bossSummonCount} slimes, want 3`);
+      }
+      if (!flags.bossSummonOnce) reasons.push("the half-hp summon fired more than once");
+      if (!flags.bossTelegraph) reasons.push("no breath tell was ever visible (snapshot boss.telegraph stayed 0)");
+      if (!flags.breathUnblocked || Math.abs(flags.breathCandleDrop - 15) > 0.01) {
+        reasons.push(`unblocked breath took ${flags.breathCandleDrop} candle, want 15`);
+      }
+      if (!flags.breathBlockPressed || !flags.breathBlocked) reasons.push("the late block did not catch the breath");
+      if (!flags.breathBlockCandleHeld) reasons.push("the blocked breath still drained the candle");
+      if (!flags.breathBossRecoil) reasons.push("the blocked breath did not throw the boss back 6 px");
+      if (!flags.failImmediate) reasons.push("damageCandle(100) did not enter the over state immediately");
+      if (!flags.failReady) reasons.push("the failure iris never reached the result page");
+      if (!(flags.failBest?.wave >= 5)) reasons.push(`the failed run did not record its wave (best ${JSON.stringify(flags.failBest)})`);
+      if (!flags.restarted || !flags.restartModsClean) {
+        reasons.push(
+          `restart was not complete (candle ${flags.restartCandle}, mana ${flags.restartMana}, enemies ${flags.restartEnemies}, modsClean ${flags.restartModsClean})`,
+        );
+      }
+      if (!flags.wave10Boss || !flags.bossKilled) reasons.push("wave 10 did not end with the boss's death");
+      if (flags.bossKillCount !== 1) reasons.push(`boss kill count ${flags.bossKillCount}, want 1`);
+      if (flags.bossEmbers !== 10) reasons.push(`boss dropped ${flags.bossEmbers} embers, want 10`);
+      if (flags.bestAfterWin?.wave !== 10 || !(flags.bestAfterWin?.time > 0)) {
+        reasons.push(`the win did not record {wave:10,time>0} (got ${JSON.stringify(flags.bestAfterWin)})`);
+      }
+      if (!flags.bestStored) reasons.push("localStorage['candle-vigil:best'] is not {wave:10,time>0}");
+      if (!flags.endingReady) reasons.push("the ending page never became ready");
+      if (!flags.returnedTitle || flags.bestAtTitle?.wave !== 10) {
+        reasons.push(`any key did not return to a title showing BEST WAVE 10 (best ${JSON.stringify(flags.bestAtTitle)})`);
+      }
+      if (!flags.reentered) reasons.push("a key on the title did not start a clean first wave");
+
       const shape = snap();
+      if (!["playing", "over", "ending"].includes(shape.state)) reasons.push(`bad run state ${shape.state}`);
+      if (shape.boss !== null) reasons.push("a boss is still on the field after the run restart");
       if (!["spawning", "intermission", "over"].includes(shape.waveState)) reasons.push(`bad waveState ${shape.waveState}`);
       if (typeof shape.block?.active !== "boolean" || typeof shape.block?.cd !== "number") reasons.push("snapshot.block missing");
       if (!shape.mods || typeof shape.mods.cdMult !== "number") reasons.push("snapshot.mods missing");

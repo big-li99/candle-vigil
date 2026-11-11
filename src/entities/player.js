@@ -134,27 +134,35 @@ export function createPlayer({
    * the shield effect in front, and (with swift) mana back. Outside it, every bite drains the candle and makes
    * him flinch, but only a bite in the wind-up (before the act's first hit window) cancels the performance,
    * and never during armor.
+   *
+   * Returns "blocked" | "hurt" | "god" so the field can answer a boss breath with the shield or the hit flash.
+   * `interrupt: false` is the boss's breath: it costs candle and still makes him flinch, but it never cuts a
+   * cast (DESIGN/M2c: the boss's move is a punishment, not a lock-out). combat.hit passes the knockback as the
+   * second argument, which keeps the default interrupt behaviour.
    */
-  function hurt(damage) {
-    if (state.god) return;
+  function hurt(damage, opts = {}) {
+    if (state.god) return "god";
     if (blockT > 0) {
       blockT = 0; // one bite per window
       state.biteFlash = 0;
       if (mods.blockMana > 0) state.mana = Math.min(state.maxMana, state.mana + mods.blockMana);
       onBlock?.();
-      return;
+      return "blocked";
     }
     state.candle = Math.max(0, state.candle - damage);
     state.biteFlash = BITE_FLASH;
     reactT = 0.22; // the visible flinch and candle-bar blink happen on every bite, interrupt or not
-    if (armorT > 0) return;
-    if (phase !== "cast" || !act) return;
+    const interrupt = typeof opts === "object" && opts !== null ? opts.interrupt !== false : true;
+    if (!interrupt) return "hurt";
+    if (armorT > 0) return "hurt";
+    if (phase !== "cast" || !act) return "hurt";
     const firstHit = timings[spell]?.hits?.[0]?.t ?? 0;
-    if (act.t >= firstHit) return; // the first hit is out: this act must play to its end
+    if (act.t >= firstHit) return "hurt"; // the first hit is out: this act must play to its end
     if (cancel("hurt")) {
       armorT = INTERRUPT_ARMOR;
       stats.interrupts = (stats.interrupts ?? 0) + 1;
     }
+    return "hurt";
   }
 
   /**
@@ -239,6 +247,22 @@ export function createPlayer({
     if (phase !== "cast") state.mana = Math.min(state.maxMana, state.mana + (MANA_REGEN + (mods.manaRegen ?? 0)) * dt);
   }
 
+  /** A complete run restart: no act, no recovery, no cooldown, no guard, no armor — the watchman re-armed. */
+  function reset() {
+    if (act?.fx?.stop) act.fx.stop();
+    act = null;
+    spell = -1;
+    phase = "idle";
+    recoverT = 0;
+    nextHit = 0;
+    armorT = 0;
+    reactT = 0;
+    blockT = 0;
+    blockCd = 0;
+    castSeq = 0;
+    for (let i = 0; i < cooldowns.length; i++) cooldowns[i] = 0;
+  }
+
   function drawIdle(frame) {
     const p = painterFor(frame);
     const bob = reactT > 0 ? 0 : Math.floor(clock * 3) % 2;
@@ -274,6 +298,7 @@ export function createPlayer({
     cancel,
     block,
     hurt,
+    reset,
     update,
     draw,
     /** The cooldown one cast of spell i would start right now (after focus/storm); the HUD wipe uses it. */

@@ -19,6 +19,7 @@ import * as shieldBlock from "../vendor/pixelfx/src/fx/impacts/shield-block.js";
 import * as poof from "../vendor/pixelfx/src/fx/spawn/poof.js";
 import * as disintegrate from "../vendor/pixelfx/src/fx/spawn/disintegrate.js";
 import * as smallExplosion from "../vendor/pixelfx/src/fx/explosions/small-explosion.js";
+import * as plasmaExplosion from "../vendor/pixelfx/src/fx/explosions/plasma-explosion.js";
 
 import * as collectBurst from "../vendor/pixelfx/src/fx/pickups/collect-burst.js";
 import * as powerStar from "../vendor/pixelfx/src/fx/pickups/power-star.js";
@@ -53,6 +54,7 @@ const REGISTRY = {
   "spawn/poof": poof,
   "spawn/disintegrate": disintegrate,
   "explosions/small-explosion": smallExplosion,
+  "explosions/plasma-explosion": plasmaExplosion,
 
   "pickups/collect-burst": collectBurst,
   "pickups/power-star": powerStar,
