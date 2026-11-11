@@ -85,6 +85,7 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
   let lungeT = 0;
   let slowT = 0;
   let slowMult = 1;
+  let stunT = 0; // EARTH WRATH: no walking and no biting for this long (knockback still travels)
   let dead = false;
   let stopX = GUARD_X; // its place in the queue, assigned by the field every step
   let front = false; // only the front of its own lane can reach the player
@@ -113,12 +114,13 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
       slowT = Math.max(0, slowT - dt);
       if (slowT === 0) slowMult = 1;
     }
+    if (stunT > 0) stunT = Math.max(0, stunT - dt);
     if (pushT > 0) {
       // knockback travels exactly `knock` px (speed fixed at the moment of the hit), then walking resumes
       const step = Math.min(dt, pushT);
       posX = Math.min(MAX_X, posX + pushV * step);
       pushT -= step;
-    } else {
+    } else if (stunT <= 0) {
       // walk to the slot assigned this step; queued enemies wait without biting, so a crowd cannot lock the player
       const gap = posX - stopX;
       const speed = T.speed * (slowT > 0 ? slowMult : 1);
@@ -163,6 +165,13 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
     slowMult = Math.min(slowT > 0 ? slowMult : 1, mult);
   }
 
+  /** EARTH WRATH's stun: stand still (no walk, no bite) for `time` seconds. Movement speed is untouched. */
+  function stun(time = 1) {
+    if (dead || time <= 0) return;
+    stunT = Math.max(stunT, time);
+    biteT = Math.max(biteT, time); // the bite cadence resumes after the stun, not in the middle of it
+  }
+
   /** Called by combat.hit: everything that happens to this enemy when it is struck. */
   function hurt(damage, knock = 0) {
     if (dead) return;
@@ -196,6 +205,7 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
     update,
     hurt,
     slow,
+    stun,
     draw,
     place,
     get x() {
@@ -225,6 +235,9 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
     },
     get slowT() {
       return slowT;
+    },
+    get stunned() {
+      return stunT > 0;
     },
     /** Debug/autotest only: seconds until this enemy's next bite, Infinity when it is not the front of its lane. */
     get biteIn() {

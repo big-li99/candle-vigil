@@ -106,7 +106,9 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
     spawn: (type = "slime", n = 1, x) => (live ? live.spawn(type, n, x) : 0),
     cast: (i = 0) => (live ? live.cast(i) : false),
     setWave: (n) => game.setWave(n),
-    skipUpgrade: () => false,
+    pickCard: (i = 0) => (live ? live.pickCard(i) : false),
+    skipUpgrade: () => (live ? live.skipUpgrade() : false),
+    block: () => (live ? live.block() : false),
     god: (on) => {
       game.state.god = !!on;
       return game.state.god;
@@ -152,6 +154,9 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
         kills: stats.kills,
         freezes: stats.freezes,
         interrupts: stats.interrupts || 0,
+        blocks: stats.blocks || 0,
+        cardsPicked: stats.cardsPicked || 0,
+        wavesCleared: stats.wavesCleared || 0,
         combo: stats.combo,
         bestCombo: stats.bestCombo,
         damageNumberPixels: stats.damageNumberPixels || 0,
@@ -229,6 +234,32 @@ function runAutotest({ game, playground, renderer, stats, report }) {
     mixedAlive: 0,
     mixedFps: 0,
     mixedErrors: 0,
+    // M2b: waves, cards, block
+    waveStart: false,
+    waveSpawnInterval: 0,
+    waveCleared: false,
+    cardsShown: [],
+    cardsUnique: false,
+    cardsAfterPick: -1,
+    candleBreath: null,
+    cardPicked: false,
+    cardChangedMods: false,
+    waveAfterCard: 0,
+    modsAfterCard: null,
+    focusCd: null,
+    capSix: 0,
+    capSixHeld: 0,
+    capEight: 0,
+    wave8Fps: 0,
+    wave4: false,
+    blockPressed: false,
+    blockAbsorbed: false,
+    blockCandleHeld: false,
+    blockCastHeld: false,
+    blockNoInterrupt: false,
+    blockSecondRefused: false,
+    blockCd: 0,
+    blockEffects: 0,
   };
   let finished = false;
   let hard = null;
@@ -315,6 +346,9 @@ function runAutotest({ game, playground, renderer, stats, report }) {
         kills: stats.kills,
         freezes: stats.freezes,
         interrupts: stats.interrupts || 0,
+        blocks: stats.blocks || 0,
+        cardsPicked: stats.cardsPicked || 0,
+        wavesCleared: stats.wavesCleared || 0,
         combo: stats.combo,
         bestCombo: stats.bestCombo,
         damageNumberPixels: stats.damageNumberPixels || 0,
@@ -335,8 +369,8 @@ function runAutotest({ game, playground, renderer, stats, report }) {
   }
 
   hard = setTimeout(() => {
-    finish([`autotest timed out after 50 s (scene ${game.scene}, phase ${game.player.phase})`]);
-  }, 50000);
+    finish([`autotest timed out after 110 s (scene ${game.scene}, phase ${game.player.phase})`]);
+  }, 110000);
 
   (async () => {
     try {
@@ -483,6 +517,99 @@ function runAutotest({ game, playground, renderer, stats, report }) {
       flags.mixedFps = stats.fps;
       flags.mixedErrors = errors.length - errorsAtStart;
 
+      // --- M2b: wave 1 spawns at its table's cadence, then clears into the intermission ---
+      await waitFor(() => alive().length === 0, 2000);
+      game.state.candle = 50; // no bites land (god is still on), so the intermission's +8 is exact
+      game.setWave(1);
+      game.state.spawnPaused = false;
+      const firstWave = await waitFor(() => alive().length >= 1, 3000);
+      const firstAt = performance.now();
+      const secondWave = await waitFor(() => alive().length >= 2, 4000);
+      const secondAt = performance.now();
+      flags.waveSpawnInterval = secondWave ? Math.round(secondAt - firstAt) : -1;
+      flags.waveStart = firstWave && secondWave && snap().wave === 1 && snap().waveState === "spawning";
+
+      // kill each body as it appears; the wave ends only when the queue is spent and the field is empty
+      const cleared = await waitFor(() => game.waveState === "intermission", 16000, () => {
+        for (const e of alive()) e.hurt(999, 0);
+      });
+      flags.waveCleared = cleared;
+      const inter = snap();
+      flags.cardsShown = inter.cards.slice();
+      flags.cardsUnique = inter.cards.length === 3 && new Set(inter.cards).size === 3;
+      flags.candleBreath = inter.candle;
+
+      // --- M2b: a card really applies, and FOCUS really shortens the slash cooldown --------
+      const modsBefore = snap().mods;
+      flags.cardPicked = window.__game.pickCard(0);
+      const afterCard = snap();
+      flags.cardsAfterPick = afterCard.cards.length;
+      flags.waveAfterCard = afterCard.wave;
+      flags.modsAfterCard = afterCard.mods;
+      flags.cardChangedMods = JSON.stringify(modsBefore) !== JSON.stringify(afterCard.mods);
+      game.state.spawnPaused = true; // hold wave 2 while the cooldown is measured
+
+      await waitFor(() => game.player.phase === "idle", 2000);
+      const focusApplied = game.upgrades.apply("focus");
+      game.player.cooldowns[0] = 0; // test-only: a clean slash cooldown to measure focus against
+      game.state.mana = 100;
+      const slashCast = game.player.cast(0);
+      const focused = snap();
+      flags.focusMult = focused.mods.cdMult;
+      flags.focusCd = focusApplied && slashCast ? focused.cooldowns[0] : null;
+      if (game.player.phase === "cast") game.player.cancel("autotest");
+      await waitFor(() => game.player.phase === "idle", 1500);
+
+      // --- M2b: the living cap holds; wave 8 allows eight bodies at 60 fps -----------------
+      game.state.spawnPaused = true;
+      game.setWave(2);
+      for (let i = 0; i < 6; i++) game.spawn("slime", 1, 300);
+      game.state.spawnPaused = false;
+      await sleep(400);
+      flags.capSix = alive().length;
+      await sleep(2700); // longer than wave 2's 2.4 s interval: the due spawn has to wait
+      flags.capSixHeld = alive().length;
+      game.state.spawnPaused = true;
+
+      game.setWave(8);
+      for (let i = 0; i < mix.length; i++) game.spawn(mix[i], 1, 200 + (i % 4) * 30);
+      game.state.spawnPaused = false;
+      await sleep(300);
+      flags.capEight = alive().length;
+      await sleep(1600);
+      flags.wave8Fps = stats.fps;
+      game.state.spawnPaused = true;
+
+      // the wave counter the HUD prints is the live state.wave
+      game.setWave(4);
+      flags.wave4 = snap().wave === 4 && snap().waveState === "spawning";
+
+      // --- M2b: Space catches a bite inside a wind-up --------------------------------------
+      game.setWave(1); // clears the field
+      game.state.god = false;
+      await waitFor(() => game.player.phase === "idle", 2000);
+      game.state.candle = 80;
+      game.state.mana = 100;
+      game.player.cooldowns.fill(0);
+      const blockInterrupts0 = stats.interrupts || 0;
+      const blockStats0 = stats.blocks || 0;
+      game.spawn("slime", 1, 124);
+      game.player.cast(3); // bolt: its first hit is at 0.76 s, so a bite at 0.6 s is inside the wind-up
+      const near = await waitFor(() => {
+        const s = alive("slime")[0];
+        return !!s && s.biteIn < 0.2;
+      }, 4000);
+      if (near) flags.blockPressed = game.block();
+      await sleep(420);
+      const bs = snap();
+      flags.blockAbsorbed = (stats.blocks || 0) === blockStats0 + 1;
+      flags.blockCandleHeld = bs.candle === 80;
+      flags.blockCastHeld = game.player.phase === "cast" || game.player.phase === "recover";
+      flags.blockNoInterrupt = (stats.interrupts || 0) === blockInterrupts0;
+      flags.blockCd = bs.block.cd;
+      flags.blockEffects = game.combat.effectCount();
+      flags.blockSecondRefused = game.block() === false;
+
       // --- final measured verdict ----------------------------------------------------
       const r = report();
       const reasons = [];
@@ -542,6 +669,41 @@ function runAutotest({ game, playground, renderer, stats, report }) {
       }
       if (flags.mixedAlive !== 8) reasons.push(`mixed field had ${flags.mixedAlive} bodies, want 8`);
       if (!(flags.mixedFps > 55)) reasons.push(`mixed field fps ${flags.mixedFps} <= 55`);
+
+      // M2b: waves, cards, block
+      if (!flags.waveStart) reasons.push("wave 1 did not start its queue");
+      if (!(flags.waveSpawnInterval >= 2350 && flags.waveSpawnInterval <= 2850)) {
+        reasons.push(`wave 1 spawn interval ${flags.waveSpawnInterval} ms, want ~2600`);
+      }
+      if (!flags.waveCleared) reasons.push("wave 1 never cleared into the intermission");
+      if (!flags.cardsUnique) reasons.push(`intermission cards [${flags.cardsShown.join(",")}] are not three distinct cards`);
+      if (flags.candleBreath !== 58) reasons.push(`intermission candle 50 -> ${flags.candleBreath}, want 58`);
+      if (!flags.cardPicked || flags.cardsAfterPick !== 0) reasons.push("pickCard did not consume the card table");
+      if (flags.waveAfterCard !== 2) reasons.push(`wave after the card is ${flags.waveAfterCard}, want 2`);
+      if (!flags.cardChangedMods) reasons.push("the picked card did not change mods");
+      if (!(flags.focusMult <= 0.8)) reasons.push(`focus cdMult ${flags.focusMult}, want <= 0.8`);
+      const wantFocusCd = Math.round(0.6 * (flags.focusMult ?? 1) * 100) / 100;
+      if (flags.focusCd === null || Math.abs(flags.focusCd - wantFocusCd) > 0.02) {
+        reasons.push(`focused slash cd ${flags.focusCd}, want ${wantFocusCd}`);
+      }
+      if (flags.capSix !== 6 || flags.capSixHeld !== 6) {
+        reasons.push(`wave 2 living cap ${flags.capSix} -> ${flags.capSixHeld}, want 6 -> 6`);
+      }
+      if (flags.capEight !== 8) reasons.push(`wave 8 allowed ${flags.capEight} bodies, want 8`);
+      if (!(flags.wave8Fps > 55)) reasons.push(`wave 8 fps ${flags.wave8Fps} <= 55`);
+      if (!flags.wave4) reasons.push("setWave(4) did not sync the HUD wave counter");
+      if (!flags.blockPressed) reasons.push("the block did not start");
+      if (!flags.blockAbsorbed) reasons.push("block did not register a successful guard (stats.blocks)");
+      if (!flags.blockCandleHeld) reasons.push("the blocked bite still drained the candle");
+      if (!flags.blockCastHeld) reasons.push("the blocked bite interrupted the cast");
+      if (!flags.blockNoInterrupt) reasons.push("the blocked bite counted as an interrupt");
+      if (!(flags.blockCd > 0)) reasons.push("the block cooldown did not start");
+      if (!flags.blockSecondRefused) reasons.push("a second block inside the cooldown was accepted");
+      const shape = snap();
+      if (!["spawning", "intermission", "over"].includes(shape.waveState)) reasons.push(`bad waveState ${shape.waveState}`);
+      if (typeof shape.block?.active !== "boolean" || typeof shape.block?.cd !== "number") reasons.push("snapshot.block missing");
+      if (!shape.mods || typeof shape.mods.cdMult !== "number") reasons.push("snapshot.mods missing");
+
       const finalSnap = snap();
       if (finalSnap.cooldowns.length !== 6) reasons.push(`cooldowns length ${finalSnap.cooldowns.length} != 6`);
       if (!finalSnap.enemies.every((e) => typeof e.y === "number")) reasons.push("snapshot enemies missing y");
