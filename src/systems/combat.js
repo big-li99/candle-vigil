@@ -5,7 +5,9 @@ import { createFx, painterFor, hex } from "../../vendor/pixelfx/src/core/index.j
 import { get as getAsset } from "../assets.js";
 
 export const HIT_FREEZE_MIN = 0.05;
-export const HIT_FREEZE_MAX = 0.12; // a longer stop than this reads as a hang, not an impact
+export const HIT_FREEZE_MAX = 0.08; // an ordinary hit's stop; longer reads as a hang, not an impact
+export const HIT_FREEZE_HEAVY = 0.14; // hammer, lightning and a killing blow: the M3 ceiling
+export const SHAKE_MAX = 0.2; // no impact shake may outlast this (M3 brief)
 export const NUMBER_FILL = hex("#fff3a6");
 const NUMBER_OUTLINE = hex("#05070d");
 const NUMBER_LIFE = 0.6;
@@ -22,6 +24,9 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
   stats.numbersShown ??= 0;
   stats.numbersCapped ??= 0;
   stats.maxNumbers ??= 0;
+  stats.lastFreeze ??= 0;
+  stats.lastShakeDur ??= 0;
+  stats.lastShakeAmp ??= 0;
   const shakeOf = renderer && typeof renderer.setShake === "function" ? renderer : { setShake() {} };
 
   const effects = []; // { inst, layer }; layer "back" is drawn under the enemies (poison cloud)
@@ -58,6 +63,10 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
    * the target and shakes the screen, but leaves no spark, number, white flash, freeze, hit stat or combo.
    * `screen: false` keeps the spark and the number but skips the global freeze and white flash — the extra
    * targets of an AoE, and every poison tick, must not each stop the world.
+   *
+   * `heavy: true` (hammer, lightning) uses the 0.14 s freeze ceiling and a 2 px shake; everything else is an
+   * ordinary 0.05–0.08 s stop at 1 px. The act's own numbers remain the source; this only keeps them inside the
+   * feel budget the M3 brief measured.
    */
   function hit({
     x = 0,
@@ -71,18 +80,23 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     count = true,
     fxImpacts = true,
     screen = true,
+    heavy = false,
   } = {}) {
     target?.hurt?.(damage, knock);
 
     if (shake > 0) {
-      shakeDur = shake;
-      shakeT = shake;
-      shakeAmp = Math.max(1, amp);
+      shakeDur = Math.min(SHAKE_MAX, shake);
+      shakeT = shakeDur;
+      shakeAmp = Math.max(1, Math.min(heavy ? 2 : 1, Math.round(amp) || 1));
+      stats.lastShakeDur = Math.round(shakeDur * 1000) / 1000;
+      stats.lastShakeAmp = shakeAmp;
     }
     if (!fxImpacts) return; // a bite's feedback is the shake it just set, the candle flash and the flinch
 
     if (screen) {
-      freeze = Math.max(freeze, Math.min(HIT_FREEZE_MAX, Math.max(HIT_FREEZE_MIN, fz)));
+      const cap = heavy ? HIT_FREEZE_HEAVY : HIT_FREEZE_MAX;
+      freeze = Math.max(freeze, Math.min(cap, Math.max(HIT_FREEZE_MIN, fz)));
+      stats.lastFreeze = Math.round(freeze * 1000) / 1000;
       stats.freezes++;
       flashT = FLASH_TIME;
     }
@@ -120,12 +134,14 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     shakeOf.setShake(sx, sy);
   }
 
-  /** A pure screen shake, for events that are not a damage hit (the boss breath landing). */
+  /** A pure screen shake, for events that are not a damage hit (the boss breath landing, the boss death). */
   function shake(seconds = 0.2, amp = 2) {
     if (seconds <= 0) return;
-    shakeDur = seconds;
-    shakeT = seconds;
-    shakeAmp = Math.max(1, amp);
+    shakeDur = Math.min(SHAKE_MAX, seconds);
+    shakeT = shakeDur;
+    shakeAmp = Math.max(1, Math.min(3, Math.round(amp) || 1));
+    stats.lastShakeDur = Math.round(shakeDur * 1000) / 1000;
+    stats.lastShakeAmp = shakeAmp;
   }
 
   /** A complete run restart: no leftover impact, number, freeze, shake or combo. */

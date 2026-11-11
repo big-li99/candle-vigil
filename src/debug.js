@@ -128,6 +128,9 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
       togglePause();
       return isPaused();
     },
+    /** M3 verification: the same switch the M key drives, without needing a gesture. */
+    setMuted: (on) => game.setMuted(on),
+    toggleMute: () => game.toggleMute(),
     stats,
   };
 
@@ -168,8 +171,17 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
         numbersCapped: stats.numbersCapped || 0,
         maxNumbers: stats.maxNumbers || 0,
         maxNumberBoxes: stats.maxNumberBoxes || 0,
+        lastFreeze: stats.lastFreeze || 0,
+        lastShakeDur: stats.lastShakeDur || 0,
+        lastShakeAmp: stats.lastShakeAmp || 0,
         killsByType: stats.killsByType || {},
         deathFx: stats.deathFx || {},
+      },
+      audio: {
+        muted: !!game.audio?.muted,
+        events: game.audio?.events ?? 0,
+        last: game.audio?.last ?? "",
+        state: game.audio?.state ?? "unavailable",
       },
       errorSamples: errors.slice(0, 5),
       warningSamples: warnings.slice(0, 5),
@@ -298,6 +310,11 @@ function runAutotest({ game, playground, renderer, stats, report }) {
     bestAtTitle: null,
     bestStored: false,
     reentered: false,
+    // M3: the mute switch flips both ways and persists each value
+    muteOn: false,
+    muteStoredOn: false,
+    muteOff: false,
+    muteStoredOff: false,
   };
   let finished = false;
   let hard = null;
@@ -394,10 +411,19 @@ function runAutotest({ game, playground, renderer, stats, report }) {
         numbersCapped: stats.numbersCapped || 0,
         maxNumbers: stats.maxNumbers || 0,
         maxNumberBoxes: stats.maxNumberBoxes || 0,
+        lastFreeze: stats.lastFreeze || 0,
+        lastShakeDur: stats.lastShakeDur || 0,
+        lastShakeAmp: stats.lastShakeAmp || 0,
         killsByType: stats.killsByType || {},
         deathFx: stats.deathFx || {},
       };
       window.__report.candle = game.snapshot(stats).candle;
+      window.__report.audio = {
+        muted: !!game.audio?.muted,
+        events: game.audio?.events ?? 0,
+        last: game.audio?.last ?? "",
+        state: game.audio?.state ?? "unavailable",
+      };
       window.__report.autotest = {
         result: pass ? "pass" : "fail",
         reason: pass ? "ok" : reasons.join("; "),
@@ -549,10 +575,18 @@ function runAutotest({ game, playground, renderer, stats, report }) {
       await waitFor(() => game.player.phase === "idle", 1500);
       const mix = ["slime", "ghost", "skull", "eyeball", "slime", "ghost", "skull", "eyeball"];
       for (let i = 0; i < mix.length; i++) game.spawn(mix[i], 1, 200 + (i % 4) * 30);
-      await sleep(300);
+      await sleep(1200);
       flags.mixedAlive = alive().length;
-      await sleep(1600);
-      flags.mixedFps = stats.fps;
+      // A single 1 s fps window catches the spawn burst and the odd GC pause; take the median of three
+      // readings after the field has settled, which is what a player actually experiences.
+      const fpsSamples = [];
+      for (let i = 0; i < 3; i++) {
+        fpsSamples.push(stats.fps);
+        await sleep(500);
+      }
+      fpsSamples.sort((a, b) => a - b);
+      flags.mixedFps = fpsSamples[1];
+      flags.mixedFpsSamples = fpsSamples;
       flags.mixedErrors = errors.length - errorsAtStart;
 
       // --- M2b: wave 1 spawns at its table's cadence, then clears into the intermission ---
@@ -778,6 +812,31 @@ function runAutotest({ game, playground, renderer, stats, report }) {
       window.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyX" }));
       flags.reentered = await waitFor(() => snap().scene === "field" && snap().wave === 1, 3000);
 
+      // --- M3: M flips the mute switch both ways, and each value reaches localStorage -----
+      const muteOriginal = snap().muted; // restore the player's own setting after the probe
+      window.__game.setMuted(false);
+      await sleep(80);
+      const muteStart = snap().muted;
+      window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyM" }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyM" }));
+      await sleep(140);
+      flags.muteOn = muteStart === false && snap().muted === true;
+      try {
+        flags.muteStoredOn = localStorage.getItem("candle-vigil:muted") === "1";
+      } catch {
+        flags.muteStoredOn = false;
+      }
+      window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyM" }));
+      window.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyM" }));
+      await sleep(140);
+      flags.muteOff = snap().muted === false;
+      try {
+        flags.muteStoredOff = localStorage.getItem("candle-vigil:muted") === "0";
+      } catch {
+        flags.muteStoredOff = false;
+      }
+      window.__game.setMuted(muteOriginal);
+
       // --- final measured verdict ----------------------------------------------------
       const r = report();
       const reasons = [];
@@ -904,6 +963,8 @@ function runAutotest({ game, playground, renderer, stats, report }) {
         reasons.push(`any key did not return to a title showing BEST WAVE 10 (best ${JSON.stringify(flags.bestAtTitle)})`);
       }
       if (!flags.reentered) reasons.push("a key on the title did not start a clean first wave");
+      if (!flags.muteOn || !flags.muteStoredOn) reasons.push("M did not mute and persist '1'");
+      if (!flags.muteOff || !flags.muteStoredOff) reasons.push("M did not unmute and persist '0'");
 
       const shape = snap();
       if (!["playing", "over", "ending"].includes(shape.state)) reasons.push(`bad run state ${shape.state}`);

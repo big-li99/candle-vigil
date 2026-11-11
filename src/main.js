@@ -2,6 +2,7 @@
 import { createRenderer, W, H } from "./frame.js";
 import { createInput } from "./input.js";
 import { createGame } from "./game.js";
+import { createAudio } from "./audio.js";
 import { createPlayground, initDebug } from "./debug.js";
 import { painterFor, hex } from "../vendor/pixelfx/src/core/index.js";
 
@@ -12,8 +13,14 @@ const canvas = document.getElementById("game");
 const renderer = createRenderer(canvas);
 const input = createInput(canvas);
 const stats = { fps: 0, hits: 0, kills: 0, freezes: 0, combo: 0, bestCombo: 0 };
-const game = createGame({ input, renderer, stats });
+const audio = createAudio();
+const game = createGame({ input, renderer, stats, audio });
 const playground = createPlayground();
+
+// Browsers only allow an AudioContext to start after a gesture. The first key or click of the session creates
+// and resumes it; every later sound is scheduled on the live context.
+window.addEventListener("keydown", () => audio.unlock());
+window.addEventListener("pointerdown", () => audio.unlock(), true);
 
 let paused = false;
 let acc = 0;
@@ -34,7 +41,18 @@ function pauseNow() {
 }
 
 function step(dt) {
+  // The mute switch belongs to the session, not to the field: it works on the title, during a run and while
+  // paused, and it never doubles as the title's "any key".
+  if (input.pressed("mute")) {
+    audio.toggleMute();
+    input.clearEdges();
+    return;
+  }
+
   if (paused) {
+    // Pausing stops the world, not the picture: the snow, candle and torches keep their own animation.
+    if (playground) playground.update(dt);
+    else game.updateAmbient(dt);
     if (input.pressed("pause")) paused = false;
     input.clearEdges();
     return;
@@ -55,6 +73,8 @@ function step(dt) {
 
 function drawPaused(frame) {
   const p = painterFor(frame);
+  // dim the frozen world first, then the existing PAUSED copy stays crisp on top of it
+  p.rect(0, 0, W, H, hex("#05070d"), 0.55);
   p.text("PAUSED", W / 2, 92, hex("#ffffff"), {
     font: "big",
     scale: 2,

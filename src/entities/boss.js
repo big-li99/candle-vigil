@@ -77,6 +77,7 @@ export function createBoss({ x = W, y = FLY_Y, seed = 1, world }) {
     breathCd = BOSS_BREATH_EVERY - BOSS_TELEGRAPH; // after the tell, wait the rest of the 6 s window
     const inst = createFx(breathFx, { x: headX(), y: headY(), flip: true, seed: seed + 11, light: 0.25 });
     breaths.push(inst);
+    world.onBossTelegraph?.(boss); // the rising fire sound starts with the read, not with the hit
   }
 
   function resolveBreath() {

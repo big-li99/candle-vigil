@@ -36,6 +36,7 @@ export const SPELLS = [
     kind: "single",
     damage: 26,
     knock: 20,
+    heavy: true, // the M3 feel budget: 0.14 s stop, 2 px shake
     reach: 150,
     thumbT: 0.30, // the dome of force with its rocks in the air: the one frame that says "smash"
     thumbFocus: [24, -14],
@@ -60,6 +61,7 @@ export const SPELLS = [
     cd: 6,
     kind: "single",
     damage: 60,
+    heavy: true, // same ceiling as the hammer: a lightning strike may stop the world for 0.14 s, not longer
     reach: Infinity, // "frontmost, distance ignored" (DESIGN §2.6)
     // The strike is re-chained at the target's x; no target means it still plays, centred 130 px out (a whiff).
     makeFx: (casterX, target) => makeBolt(target ? target.x - casterX : 130),
