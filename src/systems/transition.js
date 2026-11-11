@@ -1,7 +1,7 @@
-// A wave transition, played in 0.85 s from the vendored `transitions/slash-wipe` (cold blue, not iris — that is
-// M3's ending). The library's screen transitions are authored for a 320 x 180 stage; the game is 384 x 216, so
-// the transition renders into its own small frame and is sampled up 5:6 into the world buffer. Nearest-neighbour
-// only, so the art stays crisp. The module's own timeline is compressed to the brief's 0.6–1 s.
+// The screen transitions: the 0.85 s slash-wipe between waves, and the iris that closes on the player when the
+// candle goes out (0.8 s close, 0.5 s hold, 0.7 s open — the M2c brief allows the library's 2.2 s timeline to be
+// compressed). The library's screen transitions are authored for a 320 x 180 stage; the game is 384 x 216, so
+// each renders into its own small frame and is sampled up 5:6 into the world buffer. Nearest-neighbour only.
 import { createFrame, clearFrame, painterFor, resolveOptions } from "../../vendor/pixelfx/src/core/index.js";
 import { get as getAsset } from "../assets.js";
 import { W, H } from "../frame.js";
@@ -9,6 +9,9 @@ import { W, H } from "../frame.js";
 const SRC_W = 320;
 const SRC_H = 180;
 export const TRANSITION_TIME = 0.85;
+export const IRIS_CLOSE = 0.8;
+export const IRIS_HOLD = 0.5;
+export const IRIS_OPEN = 0.7;
 
 const xs = new Int32Array(W);
 const ys = new Int32Array(H);
@@ -21,6 +24,25 @@ function addLight(a, b) {
   const g = Math.min(255, ((a >>> 8) & 255) + ((b >>> 8) & 255));
   const bl = Math.min(255, ((a >>> 16) & 255) + ((b >>> 16) & 255));
   return (255 << 24) | (bl << 16) | (g << 8) | r;
+}
+
+/** Nearest-neighbour 5:6 upscale; a set colour erases the glow under it, a pure glint adds to the scene. */
+function blit(src, frame) {
+  for (let y = 0; y < H; y++) {
+    const srow = ys[y] * SRC_W;
+    const drow = y * W;
+    for (let x = 0; x < W; x++) {
+      const si = srow + xs[x];
+      const di = drow + x;
+      const c = src.color[si];
+      if (c) {
+        frame.color[di] = c;
+        frame.light[di] = src.light[si];
+      } else if (src.light[si]) {
+        frame.light[di] = addLight(frame.light[di], src.light[si]);
+      }
+    }
+  }
 }
 
 export function createTransition(mod = getAsset("transitions/slash-wipe"), time = TRANSITION_TIME) {
@@ -51,32 +73,104 @@ export function createTransition(mod = getAsset("transitions/slash-wipe"), time 
     p.place(0, 0);
     if (impl) impl.draw(p);
     else mod.draw(p, (1 - left / time) * (mod.meta?.duration ?? time), opts);
+    blit(src, frame);
+  }
 
-    // nearest-neighbour 5:6 upscale; a set colour also erases the glow under it (the cover hides the scene),
-    // while a pure glint adds to the scene it is drawn over
-    for (let y = 0; y < H; y++) {
-      const srow = ys[y] * SRC_W;
-      const drow = y * W;
-      for (let x = 0; x < W; x++) {
-        const si = srow + xs[x];
-        const di = drow + x;
-        const c = src.color[si];
-        if (c) {
-          frame.color[di] = c;
-          frame.light[di] = src.light[si];
-        } else if (src.light[si]) {
-          frame.light[di] = addLight(frame.light[di], src.light[si]);
-        }
-      }
-    }
+  /** Stop a transition that was interrupted by a run ending (do not leave a frozen wipe on the field). */
+  function stop() {
+    left = 0;
+    impl = null;
   }
 
   return {
     start,
     update,
     draw,
+    stop,
     get active() {
       return left > 0;
+    },
+  };
+}
+
+/**
+ * The iris. The vendored timeline closes at t=0.99, stays shut through t=1.2 and is fully open at t=1.75; this
+ * wrapper reaches the shut beat in 0.8 s, pauses for 0.5 s (the screen is black in the dark), then opens in 0.7 s.
+ * The result page is drawn under it only while it opens, so the iris reveals the page instead of hiding it.
+ */
+export function createIrisTransition(mod = getAsset("transitions/iris")) {
+  const src = createFrame(SRC_W, SRC_H);
+  const SHUT = 0.99;
+  const OPEN = 1.75;
+  const CLOSE_SPEED = SHUT / IRIS_CLOSE;
+  const OPEN_SPEED = (OPEN - SHUT) / IRIS_OPEN;
+  let impl = null;
+  let t = 0;
+  let phase = "idle"; // idle | closing | hold | opening | done
+  let holdT = 0;
+
+  function start(seed = 3, focus = [SRC_W / 2, SRC_H / 2]) {
+    const meta = mod.meta ?? {};
+    impl = mod.create ? mod.create(resolveOptions(meta, { seed, focus })) : null;
+    t = 0;
+    holdT = 0;
+    phase = "closing";
+  }
+
+  function update(dt) {
+    if (phase === "closing") {
+      const step = dt * CLOSE_SPEED;
+      t += step;
+      impl?.update(step);
+      if (t >= SHUT) {
+        t = SHUT;
+        holdT = IRIS_HOLD;
+        phase = "hold";
+      }
+    } else if (phase === "hold") {
+      holdT -= dt;
+      if (holdT <= 0) phase = "opening";
+    } else if (phase === "opening") {
+      const step = Math.min(dt * OPEN_SPEED, OPEN - t);
+      t += step;
+      impl?.update(step);
+      if (t >= OPEN - 1e-6) phase = "done";
+    }
+  }
+
+  function draw(frame) {
+    if (phase === "idle" || phase === "done") return;
+    clearFrame(src);
+    const p = painterFor(src);
+    p.place(0, 0);
+    impl?.draw(p);
+    blit(src, frame);
+  }
+
+  function reset() {
+    impl = null;
+    t = 0;
+    holdT = 0;
+    phase = "idle";
+  }
+
+  return {
+    start,
+    update,
+    draw,
+    reset,
+    get phase() {
+      return phase;
+    },
+    /** The end page may be painted under the iris once it is opening (it is revealed, not covered). */
+    get pageVisible() {
+      return phase === "opening" || phase === "done";
+    },
+    get done() {
+      return phase === "done";
+    },
+    get active() {
+      return phase === "closing" || phase === "hold" || phase === "opening";
     },
   };
 }

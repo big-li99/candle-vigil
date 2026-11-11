@@ -120,6 +120,31 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     shakeOf.setShake(sx, sy);
   }
 
+  /** A pure screen shake, for events that are not a damage hit (the boss breath landing). */
+  function shake(seconds = 0.2, amp = 2) {
+    if (seconds <= 0) return;
+    shakeDur = seconds;
+    shakeT = seconds;
+    shakeAmp = Math.max(1, amp);
+  }
+
+  /** A complete run restart: no leftover impact, number, freeze, shake or combo. */
+  function reset() {
+    effects.length = 0;
+    numbers.length = 0;
+    boxes = [];
+    freeze = 0;
+    flashT = 0;
+    shakeT = 0;
+    shakeDur = 0;
+    shakeAmp = 0;
+    combo = 0;
+    comboT = 0;
+    stats.combo = 0;
+    stats.bestCombo = 0;
+    applyShake();
+  }
+
   function update(dt, frozen = false) {
     freeze = Math.max(0, freeze - dt);
     if (flashT > 0) flashT = Math.max(0, flashT - dt);
@@ -183,6 +208,8 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
   return {
     hit,
     effect,
+    shake,
+    reset,
     update,
     draw,
     drawBack,

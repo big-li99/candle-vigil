@@ -80,6 +80,12 @@ export function createUpgrades({ onApply = null } = {}) {
     return true;
   }
 
+  /** Drop every stack (a new run): the effective numbers return to baseMods(). */
+  function reset() {
+    for (const id of Object.keys(stacks)) stacks[id] = 0;
+    recompute();
+  }
+
   /** Three distinct card ids; cards still below the cap are preferred, so a full card never wastes a slot. */
   function drawCards(count = 3) {
     const open = UPGRADES.filter((u) => stacks[u.id] < MAX_STACK).map((u) => u.id);
@@ -95,6 +101,7 @@ export function createUpgrades({ onApply = null } = {}) {
     stacks,
     mods,
     apply,
+    reset,
     drawCards,
     stacksOf: (id) => stacks[id] ?? 0,
   };

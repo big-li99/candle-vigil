@@ -40,8 +40,9 @@ function step(dt) {
     return;
   }
 
-  // P pauses the field or the fx playground; on the title any key simply starts the game.
-  if ((playground || game.scene === "field") && input.pressed("pause")) {
+  // P pauses the field or the fx playground; on the title any key simply starts the game, and the result pages
+  // consume any key themselves (their "any key" must not be stolen by the pause).
+  if ((playground || game.canPause) && input.pressed("pause")) {
     pauseNow();
     input.clearEdges();
     return;
@@ -98,10 +99,10 @@ function tick(now) {
 }
 
 window.addEventListener("blur", () => {
-  if (playground || game.scene === "field") pauseNow();
+  if (playground || game.canPause) pauseNow();
 });
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden && (playground || game.scene === "field")) pauseNow();
+  if (document.hidden && (playground || game.canPause)) pauseNow();
 });
 window.addEventListener("focus", () => {
   last = performance.now();

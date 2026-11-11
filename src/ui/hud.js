@@ -30,7 +30,16 @@ const C = {
   keyPlate: hex("#05070d"),
   wipe: hex("#05070d"),
   plateBase: hex("#060a12"),
+  bossPlate: hex("#0e0a08"),
+  bossEdge: hex("#a8541a"),
+  bossEmpty: hex("#2a1508"),
+  bossFill: hex("#ff8a2a"),
+  bossText: hex("#ffcf7a"),
 };
+
+const BOSS_BAR_W = 180; // the M2c brief's width
+const BOSS_BAR_H = 12;
+const BOSS_BAR_Y = 36; // just under the top-left plate, so it cannot cover the wave / candle readout
 
 const MARGIN = 6;
 const SLOT_H = 18;
@@ -107,6 +116,32 @@ function clearLight(p, x, y, w, h) {
   for (let yy = y1; yy < y2; yy++) for (let xx = x1; xx < x2; xx++) p.L[yy * p.w + xx] = 0;
 }
 
+/**
+ * The boss's health: a 180 px dark plate dead centre at the top, an orange fill and the word BOSS. It is drawn
+ * only while a boss is alive, and a fresh painter is not needed because it is called from the HUD pass.
+ */
+function drawBossBar(p, boss) {
+  const x = Math.round((W - BOSS_BAR_W) / 2);
+  const y = BOSS_BAR_Y;
+  const max = Math.max(1, boss.max ?? 1);
+  const fill = Math.max(0, Math.min(1, (boss.hp ?? 0) / max));
+  clearLight(p, x, y, BOSS_BAR_W, BOSS_BAR_H);
+  p.rect(x, y, BOSS_BAR_W, BOSS_BAR_H, C.bossPlate, 0.94);
+  p.rect(x, y, BOSS_BAR_W, 1, C.bossEdge);
+  p.rect(x, y + BOSS_BAR_H - 1, BOSS_BAR_W, 1, C.bossEmpty);
+  p.text("BOSS", x + 4, y + 2, C.bossText, { font: "mini", outline: C.plate });
+  p.text(`${Math.ceil(boss.hp ?? 0)}/${max}`, x + BOSS_BAR_W - 4, y + 2, C.bossText, {
+    font: "mini",
+    align: "right",
+    outline: C.plate,
+  });
+  const barX = x + 4;
+  const barY = y + 8;
+  const barW = BOSS_BAR_W - 8;
+  p.rect(barX, barY, barW, 3, C.bossEmpty);
+  p.rect(barX, barY, Math.round(barW * fill), 3, C.bossFill);
+}
+
 export function drawHud(frame, state, run = {}) {
   const spells = run.spells ?? SPELLS;
   const cooldowns = run.cooldowns ?? [];
@@ -141,6 +176,9 @@ export function drawHud(frame, state, run = {}) {
   const candleFill = Math.max(0, Math.min(1, state.candle / state.maxCandle));
   p.rect(barX, barY, Math.round(barW * candleFill), barH, bitten || low ? C.dangerBar : C.warmBar);
   p.text(String(Math.round(state.candle)), 6 + plateW - 6, 18, bitten || low ? C.danger : C.warm, { font: "mini", align: "right" });
+
+  // --- top-centre: the boss bar, only while a boss is alive --------------------------
+  if (run.boss) drawBossBar(p, run.boss);
 
   // --- bottom row: six slots + mana, on one dark plate --------------------------------
   // Six slots always exist (no unlock system). The widths are laid out from the mana panel's measured label,
