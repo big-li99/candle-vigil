@@ -41,6 +41,22 @@ const WALL_SNOW = hex("#bed1ee");
 const WALL_SNOW_DIM = hex("#7f97bb");
 const TORCH_Y = 150;
 
+// NIGHT ENDS' dawn: the night sky is replaced by an opaque cold-blue -> warm-white gradient (drawn before the
+// wall, so the stone and its snow cap stay crisp), then a light warm wash and rising glow pass over the wall and
+// floor. The result reads as "the sky got lighter" at a glance, not as a HUD tint.
+const DAWN_SKY = [
+  { y: 0, h: 16, c: hex("#7f9fc9") },
+  { y: 16, h: 16, c: hex("#8eadd4") },
+  { y: 32, h: 16, c: hex("#a2bfdd") },
+  { y: 48, h: 16, c: hex("#bdd3e6") },
+  { y: 64, h: 16, c: hex("#dbe4df") },
+  { y: 80, h: 16, c: hex("#f2e7c9") },
+];
+// The wall and floor are not dithered over: a broad additive glow does the warming, so the stone keeps its
+// texture instead of turning into a checkerboard.
+const DAWN_SUN = hex("#ffe9b0");
+const DAWN_SHAFT = hex("#ffdc9a");
+
 const SPAWN_LANE_GAP = QUEUE_GAP * 0.6; // a new enemy never materialises on top of one already in that lane
 const INTERMISSION_TIME = 6; // DESIGN §2.8: 6 s of breathing room between waves
 const CANDLE_BREATH = 8; // intermission candle refill, capped at maxCandle
@@ -78,7 +94,7 @@ function loadBest() {
   }
 }
 
-export function createGame({ input, renderer = null, stats = {} } = {}) {
+export function createGame({ input, renderer = null, stats = {}, audio = null } = {}) {
   stats.fps ??= 0;
   stats.hits ??= 0;
   stats.kills ??= 0;
@@ -112,6 +128,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     dawn: 0, // 0..1: the cold-blue dawn wash after the tenth wave
     summary: null, // {kind, wave, kills, bestCombo, time}
     result: null, // {ready}: true once the end page accepts a key
+    hudT: 0, // the HUD's own 4 Hz blink clock; keeps running while the game is paused
   };
 
   const best = loadBest(); // {wave, time}; time is the shortest completed run, 0 until the first win
@@ -146,11 +163,13 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     combat,
     stats,
     enemies,
+    audio,
     player: null,
     onKill,
     onBossHalf,
     onBossKill,
     onBossBreath,
+    onBossTelegraph,
   };
 
   // The frontmost living enemy inside the spell's reach (reach is measured from the player's x). `Infinity`
@@ -236,8 +255,10 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     onCast: addPoisonZone,
     onBlock: () => {
       stats.blocks += 1;
+      audio?.sfx("block");
       combat.effect("impacts/shield-block", PLAYER_X + 4, PLAYER_Y, ++seed);
     },
+    audio,
     stats,
   });
   world.player = player;
@@ -246,6 +267,8 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     state.embers += 1;
     stats.kills += 1;
     state.runKills += 1;
+    // the ding climbs with the combo: combat has not yet counted this hit, so the combo after it is +1
+    audio?.sfx("kill", { combo: combat.combo + 1 });
     if (enemy) {
       stats.killsByType[enemy.type] = (stats.killsByType[enemy.type] ?? 0) + 1;
       stats.deathFx[enemy.type] = enemy.deathFx ?? null;
@@ -269,7 +292,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     combat.effect("pickups/collect-burst", boss.x, boss.y - 6, ++seed);
     state.flashWhite = Math.max(state.flashWhite, WHITE_FLASH_BOSS);
     state.flashMax = Math.max(state.flashMax, WHITE_FLASH_BOSS);
-    combat.shake(0.5, 6);
+    combat.shake(0.2, 3); // the biggest shake in the game, still inside the 0.2 s / 3 px budget
   }
 
   /**
@@ -281,9 +304,14 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     if (r === "blocked") {
       boss.recoil(BOSS_RECOIL);
     } else if (r === "hurt") {
-      combat.shake(0.3, 3);
+      combat.shake(0.2, 2); // inside the M3 shake budget; the breath is big but not a 3 px boss death
       combat.effect("impacts/hit-flash", PLAYER_X, PLAYER_Y, ++seed);
     }
+  }
+
+  /** The cone has started to brighten: the rising fire sound has the full 1.5 s tell to climb. */
+  function onBossTelegraph() {
+    audio?.sfx("breath");
   }
 
   // --- the stage ---------------------------------------------------------------------
@@ -291,6 +319,29 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   const candle = createFx(candleFx, { x: 24, y: GROUND, seed: 2 });
   const torchA = createFx(torchFx, { x: 108, y: TORCH_Y, seed: 4, light: 0.8 });
   const torchB = createFx(torchFx, { x: 300, y: TORCH_Y, seed: 5, light: 0.8 });
+
+  /** The ambient stage: snow, the candle and the two torches. Runs whenever the world is not frozen. */
+  function updateStage(dt) {
+    snow.update(dt);
+    candle.update(dt);
+    torchA.update(dt);
+    torchB.update(dt);
+  }
+
+  /** The M3 low-candle cue also brightens the flame a little: the one warm light gets more urgent. */
+  function updateCandleLight() {
+    candle.options.light = state.candle < 30 ? 1.3 : 1;
+  }
+
+  /**
+   * The pause path. A paused game must still look alive: the snow keeps falling and the candle keeps breathing
+   * while the world clock, enemies and timers stay put. main.js calls this instead of update() while paused.
+   */
+  function updateAmbient(dt) {
+    state.hudT += dt; // the HUD's low-candle / low-mana blink keeps its own time
+    updateCandleLight();
+    updateStage(dt);
+  }
 
   /**
    * Start a run from the title. Every run starts from the same clean slate: no enemies, no cards, no water in
@@ -403,6 +454,9 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     cards = [];
     intermissionT = 0;
     cardOverlay.clear();
+    // the horn is data-driven too: a wave that sends a boss gets the lower, slower version
+    const bossWave = def.batches.some((batch) => batch.some((g) => g.type === "boss"));
+    audio?.sfx("wave", { boss: bossWave });
   }
 
   /** Debug/test: jump to the start of wave n with a clean field. */
@@ -561,6 +615,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       time: state.time,
     };
     state.result = { ready: false };
+    audio?.sfx("fail");
     recordBest(state.wave, 0, false); // the highest wave reached is a record even without a win
     // The iris is authored for a 320 x 180 stage; focus it on the watchman's candle-side shoulder.
     iris.start(++seed, [Math.round((PLAYER_X * 320) / W), Math.round((PLAYER_Y * 180) / H)]);
@@ -588,6 +643,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     state.flashWhite = WHITE_FLASH_WIN;
     state.flashMax = WHITE_FLASH_WIN;
     state.dawn = 0;
+    audio?.sfx("victory");
     victoryAct = createAct(getAsset("ui/level-up"), { x: PLAYER_X, y: PLAYER_Y, seed: ++seed });
     recordBest(MAX_WAVE, state.time, true);
   }
@@ -635,14 +691,13 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     // the run clock only advances while the run is live; the result pages print the frozen value
     if (state.scene === FIELD && state.run === PLAYING) state.time += dt;
     // HUD feedback keeps ticking through hit-stop like shake and the flash
+    state.hudT += dt;
+    updateCandleLight();
     if (state.biteFlash > 0) state.biteFlash = Math.max(0, state.biteFlash - dt);
     if (state.flashWhite > 0) state.flashWhite = Math.max(0, state.flashWhite - dt);
 
     if (state.scene === TITLE) {
-      snow.update(dt);
-      candle.update(dt);
-      torchA.update(dt);
-      torchB.update(dt);
+      updateStage(dt);
       if (input && input.anyPressed()) enterField();
       return;
     }
@@ -652,19 +707,13 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     if (state.run === OVER) {
       updateOver(dt, input);
       combat.update(dt, false);
-      snow.update(dt);
-      candle.update(dt);
-      torchA.update(dt);
-      torchB.update(dt);
+      updateStage(dt);
       return;
     }
     if (state.run === ENDING) {
       updateEnding(dt, input);
       combat.update(dt, false);
-      snow.update(dt);
-      candle.update(dt);
-      torchA.update(dt);
-      torchB.update(dt);
+      updateStage(dt);
       return;
     }
 
@@ -701,10 +750,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       for (let i = enemies.length - 1; i >= 0; i--) if (enemies[i].dead) enemies.splice(i, 1);
       updateWaves(dt);
       transition.update(dt);
-      snow.update(dt);
-      candle.update(dt);
-      torchA.update(dt);
-      torchB.update(dt);
+      updateStage(dt);
     }
 
     combat.update(dt, frozen);
@@ -769,11 +815,12 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   function drawField(frame) {
     snow.draw(frame, "back");
 
-    // the wall goes down over the haze, then the floor, so the seam under the ground line stays invisible
+    // the dawn sky replaces the night sky under the wall; a warm wash then tints the wall and floor
     let p = painterFor(frame);
+    if (state.dawn > 0) drawDawnSky(p);
     drawWall(p);
     drawGround(p);
-    if (state.dawn > 0) drawDawn(p);
+    if (state.dawn > 0) drawDawnWash(p);
 
     torchA.draw(frame, "front");
     torchB.draw(frame, "front");
@@ -803,6 +850,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
         cooldowns: player.cooldowns,
         cdMax: SPELLS.map((_, i) => player.cooldownFor(i)),
         boss: bossNow ? { hp: bossNow.hp, max: bossNow.maxHp } : null,
+        combo: combat.combo,
       });
       if (state.waveState === "intermission") {
         cardOverlay.draw(frame, { cards, timer: intermissionT, stacks: upgrades.stacks });
@@ -822,13 +870,24 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   }
 
   /** The dawn wash: a cold blue veil lifted toward the sky, drawn over the stage and under every body. */
-  function drawDawn(p) {
+  /** The dawn sky itself: opaque bands so stars give way to a clean cold-blue -> warm-white gradient. */
+  function drawDawnSky(p) {
     const k = state.dawn;
-    for (let y = 0; y < GROUND; y += 6) {
-      const t = y / GROUND;
-      p.rect(0, y, W, 6, hex("#7fa8d8"), (0.03 + 0.08 * (1 - t)) * k);
-    }
-    p.rect(0, 0, W, 10, hex("#cfe0fa"), 0.12 * k);
+    for (const band of DAWN_SKY) p.rect(0, band.y, W, band.h, band.c, k);
+  }
+
+  /** The warm wash and the rising light, over the stone: the wall keeps its texture, the night loses its blue. */
+  function drawDawnWash(p) {
+    const k = state.dawn;
+    // the light rises: a warm glow climbs from the floor toward the wall's cap as the dawn completes
+    const sunY = GROUND - 20 - 80 * k;
+    p.glow(W / 2, sunY, 46, DAWN_SUN, 0.34 * k);
+    p.glow(W / 2, sunY - 12, 22, DAWN_SUN, 0.24 * k);
+    p.glow(W / 2, WALL_TOP + 8, 140, DAWN_SUN, 0.16 * k); // a broad, soft lift across the stone
+    p.glowLine(0, WALL_TOP, W, WALL_TOP, 26, DAWN_SUN, 0.12 * k); // the bright horizon line on the cap
+    p.glowLine(W / 2, GROUND, W / 2, sunY, 30, DAWN_SHAFT, 0.1 * k);
+    p.glowLine(W / 2, GROUND, 138, 56, 24, DAWN_SHAFT, 0.08 * k);
+    p.glowLine(W / 2, GROUND, 246, 56, 24, DAWN_SHAFT, 0.08 * k);
   }
 
   /** Kill the additive light under a plate so the end page's text does not sit in a bright pool. */
@@ -848,9 +907,12 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     const plateH = 118;
     const x = Math.round((W - plateW) / 2);
     const y = 48;
-    p.rect(0, 0, W, H, hex("#05070d"), ending ? 0.42 : 0.62);
+    // The failure page keeps the whole night under a dark veil. NIGHT ENDS does not: a dithered veil over the
+    // bright dawn turned the sky into a checkerboard, so the panel alone carries the contrast and the dawn stays
+    // clean behind it.
+    if (!ending) p.rect(0, 0, W, H, hex("#05070d"), 0.62);
     clearLightRect(frame, x, y, plateW, plateH);
-    p.rect(x, y, plateW, plateH, hex("#0b1220"), 0.94);
+    p.rect(x, y, plateW, plateH, hex("#0b1220"), 1); // opaque: a 94% plate dithers the dawn into white dots
     p.rect(x, y, plateW, 1, hex("#3d5a84"));
     p.rect(x, y + plateH - 1, plateW, 1, hex("#0d1626"));
 
@@ -967,6 +1029,10 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       combo: combat.combo,
       candleOut: state.candleOut,
       god: state.god,
+      // M3: the mute switch and the last synth event, so the autotest can verify real state
+      muted: !!audio?.muted,
+      lastSound: audio?.last ?? "",
+      audioEvents: audio?.events ?? 0,
       fps: statsIn ? statsIn.fps : 0,
     };
   }
@@ -983,6 +1049,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     applyUpgrade,
     upgrades,
     update,
+    updateAmbient,
     draw,
     snapshot,
     damageCandle,
@@ -991,6 +1058,9 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     player,
     enemies,
     zones,
+    audio,
+    setMuted: (on) => (audio ? audio.setMuted(on) : false),
+    toggleMute: () => (audio ? audio.toggleMute() : false),
     entityCount: () => enemies.length,
     zoneCount: () => zones.length,
     get scene() {

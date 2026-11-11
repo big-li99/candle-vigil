@@ -34,6 +34,7 @@ export function createPlayer({
   findTargets = null, // every living target for an AoE
   onCast = null, // field hook for spells with no act (the poison zone)
   onBlock = null, // field hook for a successful block (shield effect, stats)
+  audio = null, // the M3 synth palette; optional and never a dependency
   stats = {},
 }) {
   // The acts are authored on the 2x actor (meta.actor = 2), so the idle body is that same character:
@@ -75,6 +76,9 @@ export function createPlayer({
     spell = index;
     nextHit = 0;
     castSeq++;
+    // Six spells, six voices (M3 brief). The instant spells speak now; the ones with a long performance speak
+    // on their own hit window in resolveHits(), so the sound lands with the picture rather than with the keypress.
+    if (sp.id === "slash" || sp.id === "poison" || sp.id === "heal") audio?.sfx(sp.id);
 
     if (sp.kind === "zone") {
       // A loop effect has no act to perform; the brief gives it a 0.3 s recovery instead. The field owns the
@@ -151,6 +155,7 @@ export function createPlayer({
     }
     state.candle = Math.max(0, state.candle - damage);
     state.biteFlash = BITE_FLASH;
+    audio?.sfx("bite"); // the low muffled thud, also the sound of a cast being cut short
     reactT = 0.22; // the visible flinch and candle-bar blink happen on every bite, interrupt or not
     const interrupt = typeof opts === "object" && opts !== null ? opts.interrupt !== false : true;
     if (!interrupt) return "hurt";
@@ -178,6 +183,10 @@ export function createPlayer({
     if (!hit || nextHit > 0) return;
     if (act.t < hit.t) return;
     nextHit = 1; // one damage window per cast, however many targets it reaches
+    // Hammer, frost and lightning are heard when they land, whether or not anything is in reach (a bolt still
+    // cracks into the ground; a whiffed hammer still smashes). The slash's swish was its cast cue; its lower
+    // "thwack" is played only on an actual hit below.
+    if (sp.id === "hammer" || sp.id === "nova" || sp.id === "bolt") audio?.sfx(sp.id);
 
     if (sp.kind === "aoe") {
       const targets = findTargets ? findTargets(sp) : [];
@@ -215,7 +224,9 @@ export function createPlayer({
       freeze: hit.freeze,
       shake: hit.shake,
       amp: hit.amp,
+      heavy: !!sp.heavy,
     });
+    if (sp.id === "slash") audio?.sfx("slashHit"); // the swish started the act; this is the lower "thwack"
     if (sp.id === "hammer" && mods.hammerStun > 0) target.stun?.(mods.hammerStun);
   }
 

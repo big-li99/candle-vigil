@@ -18,9 +18,12 @@ const C = {
   warmEmpty: hex("#241a12"),
   danger: hex("#ff6a5a"),
   dangerBar: hex("#ff4a3d"),
+  dangerBarDim: hex("#5c1713"),
   mana: hex("#b9c8ff"),
   manaBar: hex("#6f8dff"),
   manaEmpty: hex("#131a2e"),
+  manaDanger: hex("#b23a32"),
+  manaDangerDim: hex("#4d1310"),
   slotEdge: hex("#2a4166"),
   slotSide: hex("#16243a"),
   slotCoolEdge: hex("#111a29"), // cooling down: the border goes dark
@@ -35,6 +38,8 @@ const C = {
   bossEmpty: hex("#2a1508"),
   bossFill: hex("#ff8a2a"),
   bossText: hex("#ffcf7a"),
+  combo: hex("#f2f8ff"),
+  comboGold: hex("#ffcf7a"),
 };
 
 const BOSS_BAR_W = 180; // the M2c brief's width
@@ -147,6 +152,9 @@ export function drawHud(frame, state, run = {}) {
   const cooldowns = run.cooldowns ?? [];
   const cdMax = run.cdMax ?? [];
   const p = painterFor(frame);
+  // 4 full red flashes per second: eight phase flips, all driven by the HUD's own clock so it keeps blinking
+  // through hit-stop and while the game is paused.
+  const blinkOn = Math.floor((state.hudT ?? 0) * 8) % 2 === 0;
 
   // --- top-left: wave + embers, and the candle -------------------------------------
   const waveLabel = `WAVE ${state.wave}/10`;
@@ -163,9 +171,11 @@ export function drawHud(frame, state, run = {}) {
   p.text(emberLabel, 6 + plateW - 6, 8, C.warm, { font: "mini", align: "right" });
 
   const low = state.candle < 30;
-  // a bite makes the bar blink red for a moment; that is the "you were bitten but not interrupted" cue
+  // a bite makes the bar blink red for a moment; that is the "you were bitten but not interrupted" cue.
+  // Below 30 the same red comes back on its own at 4 Hz, and the number stays red.
   const bitten = (state.biteFlash ?? 0) > 0;
-  p.text("CANDLE", 12, 18, bitten || low ? C.danger : C.warm, { font: "mini" });
+  const candleDanger = bitten || low;
+  p.text("CANDLE", 12, 18, candleDanger ? C.danger : C.warm, { font: "mini" });
   const candleW = p.measure("CANDLE", { font: "mini" })[0];
   const barX = 12 + candleW + 5;
   const barW = Math.max(20, plateW - (barX - 6) - 26);
@@ -174,8 +184,9 @@ export function drawHud(frame, state, run = {}) {
   if (bitten) p.rect(barX - 1, barY - 1, barW + 2, barH + 2, C.dangerBar);
   p.rect(barX, barY, barW, barH, C.warmEmpty);
   const candleFill = Math.max(0, Math.min(1, state.candle / state.maxCandle));
-  p.rect(barX, barY, Math.round(barW * candleFill), barH, bitten || low ? C.dangerBar : C.warmBar);
-  p.text(String(Math.round(state.candle)), 6 + plateW - 6, 18, bitten || low ? C.danger : C.warm, { font: "mini", align: "right" });
+  const candleBar = bitten ? C.dangerBar : low ? (blinkOn ? C.dangerBar : C.dangerBarDim) : C.warmBar;
+  p.rect(barX, barY, Math.round(barW * candleFill), barH, candleBar);
+  p.text(String(Math.round(state.candle)), 6 + plateW - 6, 18, candleDanger ? C.danger : C.warm, { font: "mini", align: "right" });
 
   // --- top-centre: the boss bar, only while a boss is alive --------------------------
   if (run.boss) drawBossBar(p, run.boss);
@@ -237,11 +248,27 @@ export function drawHud(frame, state, run = {}) {
   p.rect(manaX, manaY, manaW, 1, C.slotEdge);
   p.rect(manaX, manaY + manaH - 1, manaW, 1, C.plateShade);
 
-  p.text(`MANA ${Math.round(state.mana)}`, manaX + 4, manaY + 3, C.mana, { font: "mini" });
+  // Empty mana is its own warning: the bar flashes dark red at the same 4 Hz as a dying candle.
+  const manaLow = state.mana < 10;
+  p.text(`MANA ${Math.round(state.mana)}`, manaX + 4, manaY + 3, manaLow ? C.manaDanger : C.mana, { font: "mini" });
   const manaBarX = manaX + 4;
   const manaBarY = manaY + 10;
   const manaBarW = manaW - 8;
   p.rect(manaBarX, manaBarY, manaBarW, 4, C.manaEmpty);
   const manaFill = Math.max(0, Math.min(1, state.mana / state.maxMana));
-  p.rect(manaBarX, manaBarY, Math.round(manaBarW * manaFill), 4, C.manaBar);
+  const manaBar = manaLow ? (blinkOn ? C.manaDanger : C.manaDangerDim) : C.manaBar;
+  p.rect(manaBarX, manaBarY, Math.round(manaBarW * manaFill), 4, manaBar);
+
+  // --- the combo readout: a small live number over the watchman, white from x3, gold from x10 ------------
+  // (painter.text, not the library's pre-drawn x5 sticker — the M3 brief)
+  const combo = run.combo ?? 0;
+  if (combo >= 3) {
+    p.text(`x${combo}`, 56, 130, combo >= 10 ? C.comboGold : C.combo, {
+      font: "mini",
+      scale: 2,
+      align: "center",
+      outline: C.plate,
+      shadow: C.plateShade,
+    });
+  }
 }

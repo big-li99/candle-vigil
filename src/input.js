@@ -19,6 +19,7 @@ export const bind = {
   Enter: "confirm",
   NumpadEnter: "confirm",
   KeyP: "pause",
+  KeyM: "mute",
 };
 
 export function createInput(canvas) {

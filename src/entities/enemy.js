@@ -72,9 +72,17 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
   const fxOptions = { x, y: T.flying ? GROUND : laneY, seed };
   if (T.flying) fxOptions.hover = GROUND - laneY;
   const fx = createFx(T.fx, fxOptions);
-  // The same creature again in white: drawn over the real one for a few frames when it is hit (DESIGN §2.11).
-  // Same seed and same step sequence, so the two stay in the same pose.
-  const flash = createFx(T.fx, { ...fxOptions, palette: FLASH_RAMP });
+  // The same creature again in white, drawn over the real one for a few frames when it is hit (DESIGN §2.11).
+  // Same seed, and it is fast-forwarded to the body's own phase on the hit, so the two stay in the same pose.
+  // Created lazily: a white copy stepped every frame for every enemy is the single most expensive thing on
+  // screen (it doubled the cost of a full wave and cost frames on the spawn burst).
+  let flash = null;
+  function flashNow() {
+    if (flash) return flash;
+    flash = createFx(T.fx, { ...fxOptions, palette: FLASH_RAMP });
+    flash.update(fx.t);
+    return flash;
+  }
 
   let posX = x;
   let hp = T.hp;
@@ -147,9 +155,12 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
     // the lean is presentation only: the queue slot and the bite timing never move with it
     const lunge = lungeT > 0 ? -LUNGE * Math.sin(Math.PI * (1 - lungeT / LUNGE_TIME)) : 0;
     fx.options.x = posX + lunge;
-    flash.options.x = posX + lunge;
     fx.update(dt);
-    flash.update(dt);
+    // the white copy only exists while it is actually being shown
+    if (flash && hurtT > 0) {
+      flash.options.x = posX + lunge;
+      flash.update(dt);
+    }
   }
 
   /** The field assigns one queue slot per enemy each step: GUARD_X + 34 * (how many are in front in its lane). */
@@ -177,6 +188,7 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
     if (dead) return;
     hp -= damage;
     hurtT = HIT_FLASH;
+    flashNow();
     if (knock > 0) {
       pushV = knock / PUSH_TIME;
       pushT = PUSH_TIME;
@@ -193,7 +205,7 @@ export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world })
   function draw(frame) {
     fx.draw(frame, "back");
     fx.draw(frame, "front");
-    if (hurtT > 0) {
+    if (hurtT > 0 && flash) {
       flash.draw(frame, "back");
       flash.draw(frame, "front");
     }
