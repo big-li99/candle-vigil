@@ -8,6 +8,7 @@ export const HIT_FREEZE_MIN = 0.05;
 export const HIT_FREEZE_MAX = 0.08; // an ordinary hit's stop; longer reads as a hang, not an impact
 export const HIT_FREEZE_HEAVY = 0.14; // hammer, lightning and a killing blow: the M3 ceiling
 export const SHAKE_MAX = 0.2; // no impact shake may outlast this (M3 brief)
+export const MAX_ONE_SHOTS = 12; // concurrent poofs/sparks/bursts; loops (the poison cloud) are exempt
 export const NUMBER_FILL = hex("#fff3a6");
 const NUMBER_OUTLINE = hex("#05070d");
 const NUMBER_LIFE = 0.6;
@@ -51,7 +52,16 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     const mod = getAsset(id);
     if (!mod) return null;
     const inst = createFx(mod, { x, y, seed: seedIn || ++seed });
-    effects.push({ inst, layer });
+    effects.push({ inst, layer, loop: !!mod.meta?.loop });
+    // Long fights used to accumulate every poof and collect burst still on screen: ~40 live one-shots is
+    // the difference between 60 fps and 38. Loops (the poison cloud) are never evicted.
+    let oneShots = 0;
+    for (const e of effects) if (!e.loop) oneShots++;
+    for (let i = 0; oneShots > MAX_ONE_SHOTS && i < effects.length; ) {
+      if (effects[i].loop) { i++; continue; }
+      effects.splice(i, 1);
+      oneShots--;
+    }
     return inst;
   }
 
