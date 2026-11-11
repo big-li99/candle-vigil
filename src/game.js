@@ -10,7 +10,7 @@ import { W, H, GROUND } from "./frame.js";
 import { drawHud } from "./ui/hud.js";
 import { createCombat } from "./systems/combat.js";
 import { createPlayer, PLAYER_X } from "./entities/player.js";
-import { createEnemy, SPAWN_X } from "./entities/enemy.js";
+import { createEnemy, SPAWN_X, GUARD_X, QUEUE_GAP } from "./entities/enemy.js";
 import { SPELLS } from "./systems/spells.js";
 
 const TITLE = "title";
@@ -33,8 +33,9 @@ const WALL_SNOW = hex("#bed1ee");
 const WALL_SNOW_DIM = hex("#7f97bb");
 const TORCH_Y = 150;
 
-const SPAWN_INTERVAL = 2.4; // s between slimes (M1 placeholder for the M2 wave table)
+const SPAWN_INTERVAL = 3.5; // s between slimes (DESIGN §2.7; M1 placeholder for the M2 wave table)
 const MAX_ALIVE = 6;
+const SPAWN_LANE_GAP = QUEUE_GAP * 0.6; // a new slime never materialises on top of one already in that lane
 const KILLS_PER_WAVE = 12;
 const CANDLE_OUT_TIME = 2;
 
@@ -43,6 +44,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   stats.hits ??= 0;
   stats.kills ??= 0;
   stats.freezes ??= 0;
+  stats.interrupts ??= 0;
 
   const state = {
     scene: TITLE,
@@ -55,6 +57,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     god: false,
     time: 0,
     candleOut: false,
+    biteFlash: 0, // HUD: the candle bar blinks red for a moment on every bite
   };
 
   const enemies = [];
@@ -85,7 +88,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     return best;
   }
 
-  const player = createPlayer({ state, combat, findTarget });
+  const player = createPlayer({ state, combat, findTarget, stats });
   world.player = player;
 
   function onKill() {
@@ -117,14 +120,44 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     return state.wave;
   }
 
+  /**
+   * The first x at or right of `at` that is not on top of a slime already in that lane. Batch/debug spawns
+   * therefore appear as a queue instead of a single point (the six-at-one-x bug), even off the right edge.
+   */
+  function freeLane(at) {
+    let x = at;
+    for (let tries = 0; tries < 64; tries++) {
+      let blocked = false;
+      for (const e of enemies) {
+        if (!e.dead && Math.abs(e.x - x) < SPAWN_LANE_GAP) {
+          blocked = true;
+          break;
+        }
+      }
+      if (!blocked) return x;
+      x += QUEUE_GAP;
+    }
+    return x;
+  }
+
   function spawn(type = "slime", n = 1, x = SPAWN_X) {
     if (String(type) !== "slime") return 0; // M1 has one enemy type
     const count = Math.max(1, Math.min(20, Math.round(Number(n)) || 1));
     const at = Number.isFinite(Number(x)) ? Math.max(24, Math.min(SPAWN_X, Number(x))) : SPAWN_X;
     for (let i = 0; i < count; i++) {
-      enemies.push(createEnemy({ x: at, y: GROUND, seed: ++seed, world }));
+      enemies.push(createEnemy({ x: freeLane(at), y: GROUND, seed: ++seed, world }));
     }
     return count;
+  }
+
+  /**
+   * One queue slot per living slime each step: the front of the queue gets the guard line, everyone behind
+   * it stands 34 px further right. Ties are broken by spawn order, so a batch never shares a slot. Killing
+   * or knocking back the front slime lets the rest walk forward on the next step.
+   */
+  function placeQueue() {
+    const alive = enemies.filter((e) => !e.dead).sort((a, b) => a.x - b.x || a.id - b.id);
+    for (let i = 0; i < alive.length; i++) alive[i].place(GUARD_X + QUEUE_GAP * i, i === 0);
   }
 
   function updateSpawner(dt) {
@@ -155,6 +188,8 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
 
   function update(dt, input) {
     state.time += dt;
+    // the candle-bar blink is HUD feedback, so it keeps ticking through hit-stop like shake and the flash
+    if (state.biteFlash > 0) state.biteFlash = Math.max(0, state.biteFlash - dt);
 
     if (state.scene === TITLE) {
       snow.update(dt);
@@ -177,6 +212,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     player.update(dt, frozen);
 
     if (!frozen) {
+      placeQueue();
       for (const e of enemies) e.update(dt);
       for (let i = enemies.length - 1; i >= 0; i--) if (enemies[i].dead) enemies.splice(i, 1);
       updateSpawner(dt);
@@ -244,8 +280,9 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     torchB.draw(frame, "front");
     candle.draw(frame, "front");
 
-    // enemies are drawn back to front by x, so a slime that got knocked past another reads correctly
-    const sorted = enemies.slice().sort((a, b) => a.x - b.x);
+    // back to front: the farthest (largest x) slime first, the one at the guard line on top of the queue.
+    // The player is drawn after every enemy, so 112 px sprites can queue up without swallowing him.
+    const sorted = enemies.slice().sort((a, b) => b.x - a.x);
     for (const e of sorted) e.draw(frame);
 
     player.draw(frame);
@@ -315,6 +352,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
         .filter((e) => !e.dead)
         .map((e) => ({ type: e.type, hp: e.hp, x: Math.round(e.x * 10) / 10 })),
       casting: player.casting,
+      armor: Math.round(player.armor * 100) / 100,
       cooldowns: player.cooldowns.map((v) => Math.round(v * 100) / 100),
       freeze: Math.round(combat.freeze * 1000) / 1000,
       candleOut: state.candleOut,

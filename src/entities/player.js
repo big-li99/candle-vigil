@@ -1,6 +1,7 @@
 // The night watch. He cannot walk: he stands at x=56 and performs. A cast is the effect's own act, and its
-// damage fires on the act's hit windows (never on a hand-copied time). Being bitten cuts the performance
-// short: no mana back, the cooldown still went.
+// damage fires on the act's hit windows (never on a hand-copied time). A bite during the wind-up cuts the
+// performance short (no mana back, the cooldown still went); once the first hit has landed the act plays
+// out, and one second of armor after an interrupt means a crowd can no longer lock him out of casting.
 import {
   createAct,
   actTiming,
@@ -16,9 +17,11 @@ import { SPELLS } from "../systems/spells.js";
 export const PLAYER_X = 56;
 export const PLAYER_Y = 196;
 export const MANA_REGEN = 10; // per second; stops for the whole cast, resumes in recovery
+export const INTERRUPT_ARMOR = 1.0; // after one interrupt the next bite cannot cut a cast for this long
+const BITE_FLASH = 0.18; // the candle bar's red blink when a bite lands (HUD reads state.biteFlash)
 const OUTLINE = hex("#050912");
 
-export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTarget = null }) {
+export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTarget = null, stats = {} }) {
   // The acts are authored on the 2x actor (meta.actor = 2), so the idle body is that same character:
   // otherwise he would double in size the moment he starts casting.
   const body = stockActor(2);
@@ -32,6 +35,7 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
   let nextHit = 0;
   let seed = 0;
   let reactT = 0; // the flinch after being bitten
+  let armorT = 0; // grace period after an interrupt: bites still hurt, but cannot cancel
   let clock = 0;
 
   /** Start a spell. Refused while busy, in recovery, short of mana, or while that spell is cooling down. */
@@ -67,17 +71,34 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
     return true;
   }
 
-  /** The candle is the only health pool; a bite drains it and breaks whatever he was casting. */
+  /**
+   * The candle is the only health pool. Every bite drains it and makes him flinch, but only a bite in the
+   * wind-up (before the act's first hit window) cancels the performance, and never during armor.
+   */
   function hurt(damage) {
     if (state.god) return;
     state.candle = Math.max(0, state.candle - damage);
-    cancel("hurt");
+    state.biteFlash = BITE_FLASH;
+    reactT = 0.22; // the visible flinch and candle-bar blink happen on every bite, interrupt or not
+    if (armorT > 0) return;
+    if (phase !== "cast" || !act) return;
+    const firstHit = timings[spell]?.hits?.[0]?.t ?? 0;
+    if (act.t >= firstHit) return; // the first hit is out: this act must play to its end
+    if (cancel("hurt")) {
+      armorT = INTERRUPT_ARMOR;
+      stats.interrupts = (stats.interrupts ?? 0) + 1;
+    }
   }
 
-  /** Fire damage on the act's own hit windows, once each, on the frontmost enemy in reach. */
+  /**
+   * Fire damage on the act's own hit windows, once each, on the frontmost enemy in reach. `strikes` is the
+   * number of blows the spell lands inside one window (DESIGN §2.6's two sword cuts); they share the act's
+   * single window and are resolved as one impact, so one cast still shows one number and one spark.
+   */
   function resolveHits() {
     const sp = SPELLS[spell];
     const hits = timings[spell]?.hits ?? [];
+    const damage = sp.damage * Math.max(1, sp.strikes ?? 1);
     while (nextHit < hits.length && act.t >= hits[nextHit].t) {
       const h = hits[nextHit++];
       const target = findTarget ? findTarget(sp) : null;
@@ -85,7 +106,7 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
       combat.hit({
         x: target.hitX,
         y: target.hitY,
-        damage: sp.damage,
+        damage,
         knock: sp.knock,
         target,
         freeze: h.freeze,
@@ -109,6 +130,7 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
     }
 
     if (frozen) return;
+    armorT = Math.max(0, armorT - dt);
     for (let i = 0; i < cooldowns.length; i++) cooldowns[i] = Math.max(0, cooldowns[i] - dt);
     if (phase === "recover") {
       recoverT -= dt;
@@ -156,6 +178,9 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
     },
     get cooldowns() {
       return cooldowns;
+    },
+    get armor() {
+      return armorT;
     },
     get mana() {
       return state.mana;
