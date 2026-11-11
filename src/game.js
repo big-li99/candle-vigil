@@ -10,7 +10,7 @@ import { W, H, GROUND } from "./frame.js";
 import { drawHud } from "./ui/hud.js";
 import { createCombat } from "./systems/combat.js";
 import { createPlayer, PLAYER_X } from "./entities/player.js";
-import { createEnemy, SPAWN_X, GUARD_X, QUEUE_GAP } from "./entities/enemy.js";
+import { createEnemy, ENEMY_TYPES, SPAWN_X, GUARD_X, QUEUE_GAP, FLY_Y } from "./entities/enemy.js";
 import { SPELLS } from "./systems/spells.js";
 
 const TITLE = "title";
@@ -45,6 +45,8 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   stats.kills ??= 0;
   stats.freezes ??= 0;
   stats.interrupts ??= 0;
+  stats.killsByType ??= {};
+  stats.deathFx ??= {};
 
   const state = {
     scene: TITLE,
@@ -58,9 +60,11 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     time: 0,
     candleOut: false,
     biteFlash: 0, // HUD: the candle bar blinks red for a moment on every bite
+    spawnPaused: false, // ?autotest=1 pauses the placeholder spawner so the script owns the field
   };
 
   const enemies = [];
+  const zones = []; // poison clouds: lifetime + 0.5 s tick, owned here because they outlive the cast
   const combat = createCombat({ renderer, stats });
   let spawnT = SPAWN_INTERVAL;
   let outT = 0;
@@ -76,24 +80,87 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     onKill,
   };
 
-  // The frontmost slime inside the spell's reach (reach is measured from the player's x).
+  // The frontmost living enemy inside the spell's reach (reach is measured from the player's x). `Infinity`
+  // is the bolt's "distance ignored": it still takes the smallest x, i.e. the one nearest the line.
   function findTarget(sp) {
+    const reach = sp.reach ?? Infinity;
     let best = null;
     for (const e of enemies) {
       if (e.dead) continue;
       const d = e.x - PLAYER_X;
-      if (d < 0 || d > sp.reach) continue;
+      if (d < 0 || d > reach) continue;
       if (!best || e.x < best.x) best = e;
     }
     return best;
   }
 
-  const player = createPlayer({ state, combat, findTarget, stats });
+  /** Every living enemy, for an AoE (frost nova is full-screen by design). */
+  function findTargets() {
+    return enemies.filter((e) => !e.dead);
+  }
+
+  /** A poison cloud is placed once, then ticks on the field clock for its lifetime. */
+  function addPoisonZone(sp) {
+    const z = sp.zone;
+    if (!z) return null;
+    const inst = combat.effect("nature/poison-cloud", z.x, GROUND, ++seed, { layer: "back" });
+    if (!inst) return null;
+    const zone = {
+      inst,
+      damage: sp.damage,
+      x: z.x,
+      left: z.left,
+      right: z.right,
+      duration: z.duration,
+      tick: z.tick,
+      t: 0,
+      tickT: 0,
+      stopped: false,
+    };
+    zones.push(zone);
+    return zone;
+  }
+
+  /** One poison tick: ground enemies only, and ghosts are immune (DESIGN §2.6 / M2a brief). */
+  function poisonTick(zone) {
+    for (const e of enemies) {
+      if (e.dead || e.flying || e.poisonImmune) continue;
+      if (e.x < zone.left || e.x > zone.right) continue;
+      // A DoT tick sparks and numbers but never stops the world or flashes it white.
+      combat.hit({ x: e.hitX, y: e.hitY, damage: zone.damage, target: e, screen: false, count: false });
+    }
+  }
+
+  function updateZones(dt) {
+    for (let i = zones.length - 1; i >= 0; i--) {
+      const z = zones[i];
+      if (z.t < z.duration) {
+        z.t += dt;
+        z.tickT += dt;
+        // the epsilon keeps 30 fixed steps (0.49999999999999994 s) from delaying the first tick by a frame
+        while (z.tickT + 1e-9 >= z.tick) {
+          z.tickT -= z.tick;
+          poisonTick(z);
+        }
+        if (z.t >= z.duration && !z.stopped) {
+          z.stopped = true;
+          z.inst.stop(); // the loop fades out over the library's 0.3 s tail, then combat drops it
+        }
+      }
+      if (z.stopped && z.inst.done()) zones.splice(i, 1);
+    }
+  }
+
+  const player = createPlayer({ state, combat, findTarget, findTargets, onCast: addPoisonZone, stats });
   world.player = player;
 
-  function onKill() {
+  function onKill(enemy) {
     state.embers += 1;
     stats.kills += 1;
+    if (enemy) {
+      stats.killsByType[enemy.type] = (stats.killsByType[enemy.type] ?? 0) + 1;
+      stats.deathFx[enemy.type] = enemy.deathFx ?? null;
+    }
     killsThisWave += 1;
     if (killsThisWave >= KILLS_PER_WAVE) {
       killsThisWave = 0;
@@ -121,15 +188,17 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   }
 
   /**
-   * The first x at or right of `at` that is not on top of a slime already in that lane. Batch/debug spawns
+   * The first x at or right of `at` that is not on top of an enemy already in that lane. Batch/debug spawns
    * therefore appear as a queue instead of a single point (the six-at-one-x bug), even off the right edge.
+   * A lane is ground or flying: the two never block each other (M2a brief).
    */
-  function freeLane(at) {
+  function freeLane(at, flying = false) {
     let x = at;
     for (let tries = 0; tries < 64; tries++) {
       let blocked = false;
       for (const e of enemies) {
-        if (!e.dead && Math.abs(e.x - x) < SPAWN_LANE_GAP) {
+        if (e.dead || !!e.flying !== !!flying) continue;
+        if (Math.abs(e.x - x) < SPAWN_LANE_GAP) {
           blocked = true;
           break;
         }
@@ -141,26 +210,32 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   }
 
   function spawn(type = "slime", n = 1, x = SPAWN_X) {
-    if (String(type) !== "slime") return 0; // M1 has one enemy type
+    const def = ENEMY_TYPES[type];
+    if (!def) return 0;
     const count = Math.max(1, Math.min(20, Math.round(Number(n)) || 1));
     const at = Number.isFinite(Number(x)) ? Math.max(24, Math.min(SPAWN_X, Number(x))) : SPAWN_X;
     for (let i = 0; i < count; i++) {
-      enemies.push(createEnemy({ x: freeLane(at), y: GROUND, seed: ++seed, world }));
+      const y = def.flying ? FLY_Y : GROUND;
+      enemies.push(createEnemy({ x: freeLane(at, def.flying), y, seed: ++seed, type, world }));
     }
     return count;
   }
 
   /**
-   * One queue slot per living slime each step: the front of the queue gets the guard line, everyone behind
-   * it stands 34 px further right. Ties are broken by spawn order, so a batch never shares a slot. Killing
-   * or knocking back the front slime lets the rest walk forward on the next step.
+   * One queue slot per living enemy each step, in its own lane: the front gets the guard line, everyone behind
+   * it stands 34 px further right. Ties are broken by spawn order, so a batch never shares a slot. Killing or
+   * knocking back the front enemy lets the rest walk forward on the next step.
    */
   function placeQueue() {
-    const alive = enemies.filter((e) => !e.dead).sort((a, b) => a.x - b.x || a.id - b.id);
-    for (let i = 0; i < alive.length; i++) alive[i].place(GUARD_X + QUEUE_GAP * i, i === 0);
+    const alive = enemies.filter((e) => !e.dead);
+    const ground = alive.filter((e) => !e.flying).sort((a, b) => a.x - b.x || a.id - b.id);
+    const air = alive.filter((e) => e.flying).sort((a, b) => a.x - b.x || a.id - b.id);
+    ground.forEach((e, i) => e.place(GUARD_X + QUEUE_GAP * i, i === 0));
+    air.forEach((e, i) => e.place(GUARD_X + QUEUE_GAP * i, i === 0));
   }
 
   function updateSpawner(dt) {
+    if (state.spawnPaused) return; // ?autotest=1 drives the field itself
     if (state.candleOut) return; // candle out: the placeholder loop stops spawning until the refill
     spawnT -= dt;
     if (spawnT > 0) return;
@@ -202,8 +277,12 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
 
     // input first: a cast starts on the very step the key went down
     if (input) {
-      if (input.pressed("slot1")) player.cast(0);
-      else if (input.pressed("slot2")) player.cast(1);
+      for (let i = 0; i < 6; i++) {
+        if (input.pressed(`slot${i + 1}`)) {
+          player.cast(i);
+          break;
+        }
+      }
       if (input.pressed("cancel")) player.cancel("cancel");
     }
 
@@ -214,6 +293,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     if (!frozen) {
       placeQueue();
       for (const e of enemies) e.update(dt);
+      updateZones(dt);
       for (let i = enemies.length - 1; i >= 0; i--) if (enemies[i].dead) enemies.splice(i, 1);
       updateSpawner(dt);
       updateCandleOut(dt);
@@ -256,7 +336,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       align: "center",
       outline: hex("#05070d"),
     });
-    p.text("1 SLASH   2 HAMMER   ESC CANCEL", W / 2, 134, hex("#7f9cc4"), {
+    p.text("1-6 CAST    ESC CANCEL", W / 2, 134, hex("#7f9cc4"), {
       font: "mini",
       align: "center",
       outline: hex("#05070d"),
@@ -280,9 +360,13 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     torchB.draw(frame, "front");
     candle.draw(frame, "front");
 
-    // back to front: the farthest (largest x) slime first, the one at the guard line on top of the queue.
-    // The player is drawn after every enemy, so 112 px sprites can queue up without swallowing him.
-    const sorted = enemies.slice().sort((a, b) => b.x - a.x);
+    // Ground effects (the poison cloud) live under the bodies that walk through them.
+    combat.drawBack(frame);
+
+    // Back to front: higher on the screen first (the flying lane), then the farthest x, so the enemy at the
+    // guard line sits on top of its queue. The player is drawn after every enemy, so 112 px sprites can queue
+    // up without swallowing him.
+    const sorted = enemies.slice().sort((a, b) => a.y - b.y || b.x - a.x);
     for (const e of sorted) e.draw(frame);
 
     player.draw(frame);
@@ -350,7 +434,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       embers: state.embers,
       enemies: enemies
         .filter((e) => !e.dead)
-        .map((e) => ({ type: e.type, hp: e.hp, x: Math.round(e.x * 10) / 10 })),
+        .map((e) => ({ type: e.type, hp: e.hp, x: Math.round(e.x * 10) / 10, y: Math.round(e.y * 10) / 10 })),
       casting: player.casting,
       armor: Math.round(player.armor * 100) / 100,
       cooldowns: player.cooldowns.map((v) => Math.round(v * 100) / 100),
@@ -373,7 +457,9 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     combat,
     player,
     enemies,
+    zones,
     entityCount: () => enemies.length,
+    zoneCount: () => zones.length,
     get scene() {
       return state.scene;
     },
