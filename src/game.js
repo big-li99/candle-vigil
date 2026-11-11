@@ -1,17 +1,21 @@
-// Scene state machine. M1 knows two states: the title, and the field running the wave-1 placeholder loop
-// (slimes, no upgrades, no boss, no game over). The field owns the world clock and the freeze rule:
+// Scene state machine. M2b runs the real ten-wave loop: a data-driven wave queue with a living-body cap, a 6 s
+// intermission with three upgrade cards, and the timed block. The field owns the world clock and the freeze rule:
 // while combat is frozen or an act is hit-stopped, enemies, spawners, timers, props and the candle all stop —
-// shake, flash, damage numbers and the HUD keep going.
+// shake, flash, damage numbers and the HUD keep going. BOSS and the ending are M2c.
 import { createFx, painterFor, hex } from "../vendor/pixelfx/src/core/index.js";
 import * as snowFx from "../vendor/pixelfx/src/fx/weather/snow.js";
 import * as candleFx from "../vendor/pixelfx/src/fx/fire/candle.js";
 import * as torchFx from "../vendor/pixelfx/src/fx/fire/torch.js";
 import { W, H, GROUND } from "./frame.js";
 import { drawHud } from "./ui/hud.js";
+import { createCardOverlay, CARD_RECTS } from "./ui/cards.js";
 import { createCombat } from "./systems/combat.js";
-import { createPlayer, PLAYER_X } from "./entities/player.js";
+import { createPlayer, PLAYER_X, PLAYER_Y } from "./entities/player.js";
 import { createEnemy, ENEMY_TYPES, SPAWN_X, GUARD_X, QUEUE_GAP, FLY_Y } from "./entities/enemy.js";
 import { SPELLS } from "./systems/spells.js";
+import { WAVES, MAX_WAVE, waveDef, queueFor } from "./systems/waves.js";
+import { createUpgrades } from "./systems/upgrades.js";
+import { createTransition } from "./systems/transition.js";
 
 const TITLE = "title";
 const FIELD = "field";
@@ -33,11 +37,11 @@ const WALL_SNOW = hex("#bed1ee");
 const WALL_SNOW_DIM = hex("#7f97bb");
 const TORCH_Y = 150;
 
-const SPAWN_INTERVAL = 3.5; // s between slimes (DESIGN §2.7; M1 placeholder for the M2 wave table)
-const MAX_ALIVE = 6;
-const SPAWN_LANE_GAP = QUEUE_GAP * 0.6; // a new slime never materialises on top of one already in that lane
-const KILLS_PER_WAVE = 12;
+const SPAWN_LANE_GAP = QUEUE_GAP * 0.6; // a new enemy never materialises on top of one already in that lane
 const CANDLE_OUT_TIME = 2;
+const INTERMISSION_TIME = 6; // DESIGN §2.8: 6 s of breathing room between waves
+const CANDLE_BREATH = 8; // intermission candle refill, capped at maxCandle
+const CARDS_PER_DRAW = 3;
 
 export function createGame({ input, renderer = null, stats = {} } = {}) {
   stats.fps ??= 0;
@@ -45,12 +49,16 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   stats.kills ??= 0;
   stats.freezes ??= 0;
   stats.interrupts ??= 0;
+  stats.blocks ??= 0;
+  stats.cardsPicked ??= 0;
+  stats.wavesCleared ??= 0;
   stats.killsByType ??= {};
   stats.deathFx ??= {};
 
   const state = {
     scene: TITLE,
     wave: 1,
+    waveState: "spawning", // spawning | intermission | over
     candle: 100,
     maxCandle: 100,
     mana: 100,
@@ -60,15 +68,30 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     time: 0,
     candleOut: false,
     biteFlash: 0, // HUD: the candle bar blinks red for a moment on every bite
-    spawnPaused: false, // ?autotest=1 pauses the placeholder spawner so the script owns the field
+    spawnPaused: false, // ?autotest=1 holds the wave spawner so the script can own the field
   };
 
   const enemies = [];
   const zones = []; // poison clouds: lifetime + 0.5 s tick, owned here because they outlive the cast
   const combat = createCombat({ renderer, stats });
-  let spawnT = SPAWN_INTERVAL;
+  const upgrades = createUpgrades({
+    onApply(id, stacks, mods) {
+      if (id !== "charm") return;
+      state.maxCandle = 100 + mods.candleCapBonus;
+      state.candle = state.maxCandle; // EMBER CHARM refills to the new cap
+    },
+  });
+  const cardOverlay = createCardOverlay();
+  const transition = createTransition();
+
+  // The live wave: its remaining spawn queue, its own cadence and cap, and the intermission clock.
+  let waveQueue = [];
+  let waveInterval = WAVES[0].interval;
+  let waveMaxAlive = WAVES[0].maxAlive;
+  let waveSpawnT = 0;
+  let cards = [];
+  let intermissionT = 0;
   let outT = 0;
-  let killsThisWave = 0;
   let seed = 0;
 
   const world = {
@@ -105,13 +128,16 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     if (!z) return null;
     const inst = combat.effect("nature/poison-cloud", z.x, GROUND, ++seed, { layer: "back" });
     if (!inst) return null;
+    // BONE EATER widens the damage area around the spell's own x and lengthens its life; the numbers only.
+    const r = (z.right - z.left) / 2;
+    const half = r * (upgrades.mods.poisonRadiusMult ?? 1);
     const zone = {
       inst,
       damage: sp.damage,
       x: z.x,
-      left: z.left,
-      right: z.right,
-      duration: z.duration,
+      left: z.x - half,
+      right: z.x + half,
+      duration: z.duration + (upgrades.mods.poisonDurBonus ?? 0),
       tick: z.tick,
       t: 0,
       tickT: 0,
@@ -151,7 +177,19 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     }
   }
 
-  const player = createPlayer({ state, combat, findTarget, findTargets, onCast: addPoisonZone, stats });
+  const player = createPlayer({
+    state,
+    combat,
+    mods: upgrades.mods,
+    findTarget,
+    findTargets,
+    onCast: addPoisonZone,
+    onBlock: () => {
+      stats.blocks += 1;
+      combat.effect("impacts/shield-block", PLAYER_X + 4, PLAYER_Y, ++seed);
+    },
+    stats,
+  });
   world.player = player;
 
   function onKill(enemy) {
@@ -160,11 +198,6 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     if (enemy) {
       stats.killsByType[enemy.type] = (stats.killsByType[enemy.type] ?? 0) + 1;
       stats.deathFx[enemy.type] = enemy.deathFx ?? null;
-    }
-    killsThisWave += 1;
-    if (killsThisWave >= KILLS_PER_WAVE) {
-      killsThisWave = 0;
-      state.wave = Math.min(10, state.wave + 1);
     }
   }
 
@@ -178,13 +211,113 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     if (state.scene !== TITLE) return false;
     state.scene = FIELD;
     state.time = 0;
+    startWave(1); // the first wave starts the moment the title is dismissed
     return true;
   }
 
+  /** --- waves ---------------------------------------------------------------------------------------------- */
+
+  function livingCount() {
+    let n = 0;
+    for (const e of enemies) if (!e.dead) n++;
+    return n;
+  }
+
+  /** Begin wave n at its first spawn: its own queue, interval and living-body cap, straight from the table. */
+  function startWave(n) {
+    const v = Math.max(1, Math.min(MAX_WAVE, Math.round(Number(n)) || 1));
+    const def = waveDef(v);
+    state.wave = v;
+    state.waveState = "spawning";
+    waveQueue = queueFor(v);
+    waveInterval = def.interval;
+    waveMaxAlive = def.maxAlive;
+    waveSpawnT = 0;
+    cards = [];
+    intermissionT = 0;
+    cardOverlay.clear();
+  }
+
+  /** Debug/test: jump to the start of wave n with a clean field. */
   function setWave(n) {
-    const v = Math.round(Number(n));
-    if (Number.isFinite(v)) state.wave = Math.max(1, Math.min(10, v));
+    enemies.length = 0;
+    for (const z of zones) z.inst.stop();
+    zones.length = 0;
+    startWave(n);
     return state.wave;
+  }
+
+  /** The queue is empty and nothing is alive: the wave is cleared. */
+  function clearWave() {
+    stats.wavesCleared += 1;
+    if (state.wave >= MAX_WAVE) {
+      // M2c owns the ending; M2b simply stops sending bodies after the tenth wave
+      state.waveState = "over";
+      return;
+    }
+    state.waveState = "intermission";
+    intermissionT = INTERMISSION_TIME;
+    state.candle = Math.min(state.maxCandle, state.candle + CANDLE_BREATH);
+    cards = upgrades.drawCards(CARDS_PER_DRAW);
+    cardOverlay.show(cards);
+  }
+
+  /** The real application point for an upgrade, shared by pickCard and the debug hook. */
+  function applyUpgrade(id) {
+    return upgrades.apply(id);
+  }
+
+  /**
+   * Take card i: it is applied for real, bursts at its own plate, and the next wave starts under a transition.
+   * Used by the 1/2/3 keys, Enter (card 0) and the 6 s timeout.
+   */
+  function pickCard(i = 0) {
+    if (state.waveState !== "intermission" || !cards.length) return false;
+    const idx = Math.max(0, Math.min(cards.length - 1, Math.round(Number(i)) || 0));
+    const id = cards[idx];
+    const r = CARD_RECTS[idx];
+    combat.effect("pickups/collect-burst", r.x + r.w / 2, r.y + 58, ++seed);
+    applyUpgrade(id);
+    cards = [];
+    intermissionT = 0;
+    cardOverlay.clear();
+    stats.cardsPicked += 1;
+    if (state.wave >= MAX_WAVE) {
+      state.waveState = "over";
+      return true;
+    }
+    startWave(state.wave + 1);
+    transition.start(3 + state.wave);
+    return true;
+  }
+
+  function skipUpgrade() {
+    return pickCard(0);
+  }
+
+  /**
+   * The wave clock. A due spawn waits (without losing its place in the queue) while the screen is at its living
+   * cap; an empty queue plus an empty field ends the wave. The autotest's spawnPaused switch freezes this whole
+   * loop, so its hand-placed bodies cannot trip a wave transition.
+   */
+  function updateWaves(dt) {
+    if (state.spawnPaused) return;
+    if (state.waveState === "intermission") {
+      intermissionT = Math.max(0, intermissionT - dt);
+      cardOverlay.update(dt);
+      if (intermissionT <= 0) pickCard(0); // DESIGN §2.8: the countdown takes the first card
+      return;
+    }
+    if (state.waveState !== "spawning") return;
+    if (waveQueue.length > 0) {
+      waveSpawnT -= dt;
+      if (waveSpawnT <= 0 && livingCount() < waveMaxAlive) {
+        spawn(waveQueue.shift(), 1);
+        waveSpawnT = waveInterval;
+      }
+    } else if (livingCount() === 0) {
+      clearWave();
+    }
   }
 
   /**
@@ -234,16 +367,6 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     air.forEach((e, i) => e.place(GUARD_X + QUEUE_GAP * i, i === 0));
   }
 
-  function updateSpawner(dt) {
-    if (state.spawnPaused) return; // ?autotest=1 drives the field itself
-    if (state.candleOut) return; // candle out: the placeholder loop stops spawning until the refill
-    spawnT -= dt;
-    if (spawnT > 0) return;
-    spawnT = SPAWN_INTERVAL;
-    if (enemies.length >= MAX_ALIVE) return;
-    spawn("slime", 1);
-  }
-
   function updateCandleOut(dt) {
     if (!state.candleOut) {
       if (!state.god && state.candle <= 0) {
@@ -275,15 +398,26 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       return;
     }
 
-    // input first: a cast starts on the very step the key went down
+    // input first: a cast (or a card, between waves) starts on the very step the key went down
     if (input) {
-      for (let i = 0; i < 6; i++) {
-        if (input.pressed(`slot${i + 1}`)) {
-          player.cast(i);
-          break;
+      if (state.waveState === "intermission") {
+        for (let i = 0; i < CARDS_PER_DRAW; i++) {
+          if (input.pressed(`slot${i + 1}`)) {
+            pickCard(i);
+            break;
+          }
         }
+        if (input.pressed("confirm")) pickCard(0); // Enter takes the first card
+      } else {
+        for (let i = 0; i < 6; i++) {
+          if (input.pressed(`slot${i + 1}`)) {
+            player.cast(i);
+            break;
+          }
+        }
+        if (input.pressed("block")) player.block();
+        if (input.pressed("cancel")) player.cancel("cancel");
       }
-      if (input.pressed("cancel")) player.cancel("cancel");
     }
 
     // the act keeps ticking only to thaw its own hit-stop
@@ -295,7 +429,8 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       for (const e of enemies) e.update(dt);
       updateZones(dt);
       for (let i = enemies.length - 1; i >= 0; i--) if (enemies[i].dead) enemies.splice(i, 1);
-      updateSpawner(dt);
+      updateWaves(dt);
+      transition.update(dt);
       updateCandleOut(dt);
       snow.update(dt);
       candle.update(dt);
@@ -336,7 +471,7 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
       align: "center",
       outline: hex("#05070d"),
     });
-    p.text("1-6 CAST    ESC CANCEL", W / 2, 134, hex("#7f9cc4"), {
+    p.text("1-6 CAST   SPACE BLOCK   ESC CANCEL", W / 2, 134, hex("#7f9cc4"), {
       font: "mini",
       align: "center",
       outline: hex("#05070d"),
@@ -372,9 +507,17 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     player.draw(frame);
     combat.draw(frame);
     snow.draw(frame, "front");
-    drawHud(frame, state, { spells: SPELLS, cooldowns: player.cooldowns });
-    combat.drawFlash(frame);
+    drawHud(frame, state, {
+      spells: SPELLS,
+      cooldowns: player.cooldowns,
+      cdMax: SPELLS.map((_, i) => player.cooldownFor(i)),
+    });
+    if (state.waveState === "intermission") {
+      cardOverlay.draw(frame, { cards, timer: intermissionT, stacks: upgrades.stacks });
+    }
     if (state.candleOut) drawCandleOut(frame);
+    transition.draw(frame); // the wave wipe covers everything, HUD included
+    combat.drawFlash(frame);
   }
 
   function drawCandleOut(frame) {
@@ -426,15 +569,21 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
   }
 
   function snapshot(statsIn) {
+    const mods = {};
+    for (const [k, v] of Object.entries(upgrades.mods)) mods[k] = Math.round(v * 1000) / 1000;
     return {
       scene: state.scene,
       wave: state.wave,
+      waveState: state.waveState,
       candle: state.candle,
       mana: state.mana,
       embers: state.embers,
       enemies: enemies
         .filter((e) => !e.dead)
         .map((e) => ({ type: e.type, hp: e.hp, x: Math.round(e.x * 10) / 10, y: Math.round(e.y * 10) / 10 })),
+      cards: state.waveState === "intermission" ? cards.slice() : [],
+      block: { active: player.blockActive, cd: Math.round(player.blockCd * 1000) / 1000 },
+      mods,
       casting: player.casting,
       armor: Math.round(player.armor * 100) / 100,
       cooldowns: player.cooldowns.map((v) => Math.round(v * 100) / 100),
@@ -451,6 +600,11 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     setWave,
     spawn,
     cast: (i = 0) => player.cast(i),
+    block: () => player.block(),
+    pickCard,
+    skipUpgrade,
+    applyUpgrade,
+    upgrades,
     update,
     draw,
     snapshot,
@@ -465,6 +619,12 @@ export function createGame({ input, renderer = null, stats = {} } = {}) {
     },
     get wave() {
       return state.wave;
+    },
+    get waveState() {
+      return state.waveState;
+    },
+    get transitionActive() {
+      return transition.active;
     },
   };
 }

@@ -29,6 +29,7 @@ import * as candle from "../vendor/pixelfx/src/fx/fire/candle.js";
 import * as torch from "../vendor/pixelfx/src/fx/fire/torch.js";
 import * as fireBreath from "../vendor/pixelfx/src/fx/fire/fire-breath.js";
 import * as iris from "../vendor/pixelfx/src/fx/transitions/iris.js";
+import * as slashWipe from "../vendor/pixelfx/src/fx/transitions/slash-wipe.js";
 
 import * as snow from "../vendor/pixelfx/src/fx/weather/snow.js";
 
@@ -62,6 +63,7 @@ const REGISTRY = {
   "fire/torch": torch,
   "fire/fire-breath": fireBreath,
   "transitions/iris": iris,
+  "transitions/slash-wipe": slashWipe,
 
   "weather/snow": snow,
 };

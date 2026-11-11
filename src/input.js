@@ -16,6 +16,8 @@ export const bind = {
   Numpad6: "slot6",
   Space: "block",
   Escape: "cancel",
+  Enter: "confirm",
+  NumpadEnter: "confirm",
   KeyP: "pause",
 };
 

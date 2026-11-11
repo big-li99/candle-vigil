@@ -18,17 +18,22 @@ export const PLAYER_X = 56;
 export const PLAYER_Y = 196;
 export const MANA_REGEN = 10; // per second; stops for the whole cast, resumes in recovery
 export const INTERRUPT_ARMOR = 1.0; // after one interrupt the next bite cannot cut a cast for this long
+export const BLOCK_WINDOW = 0.35; // DESIGN §2.4: the block is a short timed window, not a hold
+export const BLOCK_CD = 1.2; // an empty block only costs this cooldown
 const BITE_FLASH = 0.18; // the candle bar's red blink when a bite lands (HUD reads state.biteFlash)
 const OUTLINE = hex("#050912");
+const GUARD = hex("#9fe8ff");
 
 export function createPlayer({
   x = PLAYER_X,
   y = PLAYER_Y,
   state,
   combat,
+  mods = {}, // the live upgrade numbers (src/systems/upgrades.js); never copied, always read
   findTarget = null, // the frontmost single target for this spell (reach is the spell's business)
   findTargets = null, // every living target for an AoE
   onCast = null, // field hook for spells with no act (the poison zone)
+  onBlock = null, // field hook for a successful block (shield effect, stats)
   stats = {},
 }) {
   // The acts are authored on the 2x actor (meta.actor = 2), so the idle body is that same character:
@@ -47,16 +52,26 @@ export function createPlayer({
   let reactT = 0; // the flinch after being bitten
   let armorT = 0; // grace period after an interrupt: bites still hurt, but cannot cancel
   let clock = 0;
+  let blockT = 0; // seconds left of the current block window (0 = not guarding)
+  let blockCd = 0; // seconds until Space can start another window
+  let blockMax = BLOCK_WINDOW; // this window's length, for drawing the guard telegraph
 
-  /** Start a spell. Refused while busy, in recovery, short of mana, or while that spell is cooling down. */
+  /** The cooldown one cast of spell i would start, after focus and storm. */
+  function cooldownOf(sp) {
+    const cut = sp.id === "bolt" ? mods.boltCdCut ?? 0 : 0;
+    return Math.max(0.1, sp.cd * (mods.cdMult ?? 1) - cut);
+  }
+
+  /** Start a spell. Refused while busy, in recovery, short of mana, cooling down, or guarding. */
   function cast(index) {
     if (phase !== "idle") return false;
+    if (blockT > 0) return false; // DESIGN §2.4: the block window refuses casts (it can still eat a bite)
     const sp = SPELLS[index];
     if (!sp) return false;
     if (cooldowns[index] > 0) return false;
     if (state.mana < sp.cost) return false;
     state.mana -= sp.cost;
-    cooldowns[index] = sp.cd;
+    cooldowns[index] = cooldownOf(sp);
     spell = index;
     nextHit = 0;
     castSeq++;
@@ -73,7 +88,8 @@ export function createPlayer({
 
     if (sp.kind === "heal") {
       // The candle is the whole heal: applied on the cast, capped, and deliberately unable to overflow.
-      state.candle = Math.min(state.maxCandle, state.candle + (sp.heal ?? 0));
+      state.candle = Math.min(state.maxCandle, state.candle + (sp.heal ?? 0) * (mods.healMult ?? 1));
+      if (mods.healMana > 0) state.mana = Math.min(state.maxMana, state.mana + mods.healMana);
     }
 
     // Bolt has to know where to put its strike before the act exists; every other act already knows.
@@ -102,11 +118,32 @@ export function createPlayer({
   }
 
   /**
-   * The candle is the only health pool. Every bite drains it and makes him flinch, but only a bite in the
-   * wind-up (before the act's first hit window) cancels the performance, and never during armor.
+   * Space starts a 0.35 s guard (0.5 s with swift). It may be raised in the middle of a long cast — that is the
+   * whole point of the mechanic — but no new cast may start while it is up. An empty block is only the cooldown.
+   */
+  function block() {
+    if (blockCd > 0) return false;
+    blockMax = BLOCK_WINDOW + (mods.blockWindowBonus ?? 0);
+    blockT = blockMax;
+    blockCd = BLOCK_CD;
+    return true;
+  }
+
+  /**
+   * The candle is the only health pool. A bite inside the block window is caught: no candle loss, no interrupt,
+   * the shield effect in front, and (with swift) mana back. Outside it, every bite drains the candle and makes
+   * him flinch, but only a bite in the wind-up (before the act's first hit window) cancels the performance,
+   * and never during armor.
    */
   function hurt(damage) {
     if (state.god) return;
+    if (blockT > 0) {
+      blockT = 0; // one bite per window
+      state.biteFlash = 0;
+      if (mods.blockMana > 0) state.mana = Math.min(state.maxMana, state.mana + mods.blockMana);
+      onBlock?.();
+      return;
+    }
     state.candle = Math.max(0, state.candle - damage);
     state.biteFlash = BITE_FLASH;
     reactT = 0.22; // the visible flinch and candle-bar blink happen on every bite, interrupt or not
@@ -150,7 +187,7 @@ export function createPlayer({
           screen: i === 0,
           count: i === 0,
         });
-        if (sp.slow) t.slow?.(sp.slow.mult, sp.slow.time);
+        if (sp.slow) t.slow?.(sp.slow.mult, sp.slow.time + (mods.slowBonus ?? 0));
       }
       return;
     }
@@ -158,17 +195,20 @@ export function createPlayer({
     if (sp.kind !== "single") return;
     const target = findTarget ? findTarget(sp) : null;
     if (!target) return; // nothing in reach: the act's own dust and sparks are the miss feedback
-    const damage = sp.damage * Math.max(1, sp.strikes ?? 1);
+    const slashMult = sp.id === "slash" ? mods.slashMult ?? 1 : 1;
+    const damage = sp.damage * Math.max(1, sp.strikes ?? 1) * slashMult;
+    const knock = (sp.knock ?? 0) * (sp.id === "hammer" ? mods.hammerKnockMult ?? 1 : 1);
     combat.hit({
       x: target.hitX,
       y: target.hitY,
       damage,
-      knock: sp.knock ?? 0,
+      knock,
       target,
       freeze: hit.freeze,
       shake: hit.shake,
       amp: hit.amp,
     });
+    if (sp.id === "hammer" && mods.hammerStun > 0) target.stun?.(mods.hammerStun);
   }
 
   function update(dt, frozen = false) {
@@ -186,6 +226,8 @@ export function createPlayer({
 
     if (frozen) return;
     armorT = Math.max(0, armorT - dt);
+    if (blockT > 0) blockT = Math.max(0, blockT - dt);
+    if (blockCd > 0) blockCd = Math.max(0, blockCd - dt);
     for (let i = 0; i < cooldowns.length; i++) cooldowns[i] = Math.max(0, cooldowns[i] - dt);
     if (phase === "recover") {
       recoverT -= dt;
@@ -194,7 +236,7 @@ export function createPlayer({
         phase = "idle";
       }
     }
-    if (phase !== "cast") state.mana = Math.min(state.maxMana, state.mana + MANA_REGEN * dt);
+    if (phase !== "cast") state.mana = Math.min(state.maxMana, state.mana + (MANA_REGEN + (mods.manaRegen ?? 0)) * dt);
   }
 
   function drawIdle(frame) {
@@ -209,9 +251,20 @@ export function createPlayer({
     drawActor(p, body);
   }
 
+  /** The guard while the window is up: a thin pale arc in front, hidden the moment it is spent or expires. */
+  function drawGuard(frame) {
+    if (blockT <= 0) return;
+    const p = painterFor(frame);
+    const k = Math.min(1, blockT / Math.max(0.01, blockMax));
+    p.place(x + 12, y - 24);
+    p.arc(0, 0, 17, 2, -1.15, 1.15, GUARD, 0.22 + 0.4 * k);
+    p.light(21, 0, GUARD, 0.12 * k);
+  }
+
   function draw(frame) {
     if (act) act.draw(frame, { target: false });
     else drawIdle(frame);
+    drawGuard(frame);
   }
 
   return {
@@ -219,9 +272,18 @@ export function createPlayer({
     y,
     cast,
     cancel,
+    block,
     hurt,
     update,
     draw,
+    /** The cooldown one cast of spell i would start right now (after focus/storm); the HUD wipe uses it. */
+    cooldownFor: (i) => (SPELLS[i] ? cooldownOf(SPELLS[i]) : 0),
+    /** True while a cast is still before its first hit window: the only time a bite can cut it. */
+    get windup() {
+      if (phase !== "cast" || !act) return false;
+      const first = timings[spell]?.hits?.[0]?.t ?? 0;
+      return act.t < first;
+    },
     get casting() {
       return phase === "cast";
     },
@@ -240,11 +302,14 @@ export function createPlayer({
     get mana() {
       return state.mana;
     },
-    /** True while a cast is still before its first hit window: the only time a bite can cut it. */
-    get windup() {
-      if (phase !== "cast" || !act) return false;
-      const first = timings[spell]?.hits?.[0]?.t ?? 0;
-      return act.t < first;
+    get blockActive() {
+      return blockT > 0;
+    },
+    get blockCd() {
+      return blockCd;
+    },
+    get blockWindow() {
+      return BLOCK_WINDOW + (mods.blockWindowBonus ?? 0);
     },
     get castSeq() {
       return castSeq;

@@ -110,6 +110,7 @@ function clearLight(p, x, y, w, h) {
 export function drawHud(frame, state, run = {}) {
   const spells = run.spells ?? SPELLS;
   const cooldowns = run.cooldowns ?? [];
+  const cdMax = run.cdMax ?? [];
   const p = painterFor(frame);
 
   // --- top-left: wave + embers, and the candle -------------------------------------
@@ -179,8 +180,9 @@ export function drawHud(frame, state, run = {}) {
       const thumbX = x + Math.floor((slotW - THUMB_W) / 2);
       blit(p, thumbFor(spell), THUMB_W, THUMB_H, thumbX, y + 1);
       // cooldown wipe: a dark curtain over the icon that shrinks away as the spell comes back
-      if (cooling && spell.cd > 0) {
-        const h = Math.round(THUMB_H * Math.max(0, Math.min(1, cd / spell.cd)));
+      const full = cdMax[i] ?? spell.cd;
+      if (cooling && full > 0) {
+        const h = Math.round(THUMB_H * Math.max(0, Math.min(1, cd / full)));
         if (h > 0) p.rect(thumbX, y + 1, THUMB_W, h, C.wipe, 0.78);
       }
     }
