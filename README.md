@@ -1,5 +1,7 @@
 # Candlelight Vigil · 烛火守夜
 
+**▶ Play: https://big-li99.github.io/candle-vigil/** — desktop browser, click the canvas, press any key.
+
 A single-screen pixel action game where **you cannot move**. You are the night watch: the candle behind you is the
 only life you have, and every spell you know takes 0.75–7 seconds to perform. Cast at the wrong moment and the dark
 interrupts you.
