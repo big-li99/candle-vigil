@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Candlelight Vigil — a single-screen pixel action game on pixelfx",
   "scripts": {
-    "dev": "esbuild src/main.js --bundle --format=iife --target=es2020 --outfile=dist/game.js --servedir=. --serve=0.0.0.0:8788 --watch",
+    "dev": "esbuild src/main.js --bundle --format=iife --target=es2020 --outfile=dist/game.js --servedir=. --serve=0.0.0.0:8788 --watch=forever",
     "build": "esbuild src/main.js --bundle --format=iife --target=es2020 --outfile=dist/game.js --minify",
     "serve": "python3 -m http.server 8788"
   },
