@@ -111,6 +111,13 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
       game.state.god = !!on;
       return game.state.god;
     },
+    /** Test setup only: put the candle at a known value so the heal check can start from 50. */
+    candle: (v) => {
+      if (!live) return 0;
+      const n = Math.max(0, Math.min(game.state.maxCandle, Number(v)));
+      if (Number.isFinite(n)) game.state.candle = n;
+      return game.state.candle;
+    },
     pause: () => {
       togglePause();
       return isPaused();
@@ -148,6 +155,12 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
         combo: stats.combo,
         bestCombo: stats.bestCombo,
         damageNumberPixels: stats.damageNumberPixels || 0,
+        numbersShown: stats.numbersShown || 0,
+        numbersCapped: stats.numbersCapped || 0,
+        maxNumbers: stats.maxNumbers || 0,
+        maxNumberBoxes: stats.maxNumberBoxes || 0,
+        killsByType: stats.killsByType || {},
+        deathFx: stats.deathFx || {},
       },
       errorSamples: errors.slice(0, 5),
       warningSamples: warnings.slice(0, 5),
@@ -160,78 +173,95 @@ export function initDebug({ game, playground, renderer, stats, isPaused, toggleP
     if (params.has("autotest")) window.__report.autotest = { result: "pending", reason: "" };
   }, 2500);
 
-  if (params.has("autotest")) runAutotest({ game, playground, renderer, stats, report });
+  if (params.has("autotest")) {
+    // The scripted run owns the field; the placeholder spawner would otherwise add slimes between assertions.
+    if (!playground) game.state.spawnPaused = true;
+    runAutotest({ game, playground, renderer, stats, report });
+  }
 
   return { report };
 }
 
 /**
- * The scripted M1.5 session, in two measured acts:
- *   1. one slime inside sword reach is killed by one cast (one number, one spark, kills + 1);
- *   2. a slime bites during a hammer wind-up, the cast is interrupted, and the very next cast still lands
- *      (the armor rule) — the exact deadlock M1 shipped with.
- * Every assertion is a measured number: counters the game incremented, the world buffer's own pixels, the
- * canvas transform.
+ * The scripted M2a session. It keeps the M1.5 feel checks (a near kill, an interrupt in a wind-up, and the
+ * very next cast still landing) and adds measured checks for the six spells, the four enemies, the poison
+ * immunity and an eight-body frame. Only a real browser can judge the picture; every number below is read
+ * back from the running game, never assumed.
+ *
+ * The test owns the field: the placeholder spawner is paused, mana is topped up before a cast so a long
+ * script can afford six spells, and two cooldowns are cleared for repeat casts (the whiff and the heal cap).
+ * Every cost and cooldown it reports is still measured across the real game.cast() call, before any world
+ * step could regenerate mana.
  */
 function runAutotest({ game, playground, renderer, stats, report }) {
   if (playground) return;
 
-  const killsBefore = stats.kills;
-  const interruptsBefore = stats.interrupts || 0;
-  let nearKilled = false;
-  let guardSpawned = false;
-  let hammerCast = false;
-  let sawInterrupt = false;
-  let hitsAfterInterrupt = 0;
-  let followUpCast = false;
-  let followUpLanded = false;
+  const errorsAtStart = errors.length;
+  const castable = [false, false, false, false, false, false];
+  const costs = [null, null, null, null, null, null];
+  const cooldowns = [0, 0, 0, 0, 0, 0];
+  const flags = {
+    nearKilled: false,
+    hammerCast: false,
+    sawInterrupt: false,
+    followUpCast: false,
+    followUpLanded: false,
+    novaCast: false,
+    novaKills: 0,
+    maxNovaNumbers: 0,
+    boltCast: false,
+    boltFarKill: false,
+    whiffCast: false,
+    whiffPlaying: false,
+    whiffDone: false,
+    whiffNoHits: false,
+    poisonCast: false,
+    poisonCastPhase: "",
+    poisonSlimeDamaged: false,
+    poisonGhostUnhurt: false,
+    poisonTicks: 0,
+    ghostKilled: false,
+    healCast: false,
+    healFrom50: null,
+    healCapCast: false,
+    healCap: null,
+    types: {},
+    mixedAlive: 0,
+    mixedFps: 0,
+    mixedErrors: 0,
+  };
+  let finished = false;
+  let hard = null;
 
-  setTimeout(() => {
-    if (game.scene === "title") game.enterField();
-  }, 400);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const snap = () => game.snapshot(stats);
+  const alive = (type) => game.enemies.filter((e) => !e.dead && (!type || e.type === type));
 
-  // A slime well inside sword reach (56 + 140 = 196), so the fight does not depend on walking distance.
-  setTimeout(() => {
-    if (game.scene === "field") game.spawn("slime", 1, 160);
-  }, 500);
-
-  // Press "1" until the near slime dies; a refused cast costs nothing.
-  const caster = setInterval(() => {
-    if (game.scene === "field" && !nearKilled) game.cast(0);
-  }, 150);
-
-  // Once the near kill is measured, put one slime on the guard line. Its first bite is due 0.6 s later;
-  // the director casts the slow hammer just before it, so the bite lands inside the wind-up, then casts the
-  // fast slash as soon as the interrupt counter moves.
-  setTimeout(() => {
-    if (game.scene !== "field") return;
-    game.spawn("slime", 1, 124);
-    guardSpawned = true;
-  }, 2500);
-
-  const director = setInterval(() => {
-    if (game.scene !== "field") return;
-    if (!nearKilled && stats.kills > killsBefore) nearKilled = true;
-
-    if (guardSpawned && nearKilled && !hammerCast) {
-      for (const e of game.enemies) {
-        if (e.dead) continue;
-        // biteIn is the front slime's own countdown, so this is deterministic rather than a guessed delay
-        if (e.biteIn < 0.1 && game.player.phase === "idle" && game.cast(1)) {
-          hammerCast = true;
-          break;
-        }
-      }
+  async function waitFor(cond, timeoutMs, tick) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < timeoutMs) {
+      if (tick) tick();
+      if (cond()) return true;
+      await sleep(16);
     }
-    if (hammerCast && !sawInterrupt && stats.interrupts > interruptsBefore) {
-      sawInterrupt = true;
-      hitsAfterInterrupt = stats.hits;
-    }
-    if (sawInterrupt && !followUpCast && game.cast(0)) followUpCast = true;
-    if (followUpCast && !followUpLanded && stats.hits > hitsAfterInterrupt) followUpLanded = true;
-  }, 16);
+    return !!cond();
+  }
 
-  // Damage numbers are measured, not assumed: count the digits' own fill color inside the box combat
+  /** A cast with its cost and cooldown measured across it; mana is topped up first so the script can afford it. */
+  function startCast(i) {
+    game.state.mana = 100;
+    const before = snap();
+    const ok = game.cast(i);
+    const after = snap();
+    if (ok) {
+      castable[i] = true;
+      costs[i] = Math.round((before.mana - after.mana) * 100) / 100;
+      cooldowns[i] = after.cooldowns[i] ?? 0;
+    }
+    return ok;
+  }
+
+  // Damage numbers are measured, not assumed: count the digits' own fill colour inside the box combat
   // reported for the number it just drew. The world buffer is read when the renderer exposes it (the light
   // buffer is added later at composite time, so the colour there is exactly what p.text wrote); the canvas
   // is the fallback, with a tolerance because glow is added on top of it.
@@ -244,6 +274,7 @@ function runAutotest({ game, playground, renderer, stats, report }) {
     if (!combat || typeof combat.numberBoxes !== "function") return;
     const boxes = combat.numberBoxes();
     if (!boxes.length) return;
+    if (boxes.length > (stats.maxNumberBoxes || 0)) stats.maxNumberBoxes = boxes.length;
     const world = renderer.frame;
     const canvasPx = world ? null : renderer.readPixels().data;
     let n = 0;
@@ -268,30 +299,11 @@ function runAutotest({ game, playground, renderer, stats, report }) {
     if (n > (stats.damageNumberPixels || 0)) stats.damageNumberPixels = n;
   }, 80);
 
-  setTimeout(() => {
-    clearInterval(caster);
-    clearInterval(director);
+  function finish(reasons) {
+    if (finished) return;
+    finished = true;
     clearInterval(probe);
-
-    const r = report();
-    const reasons = [];
-    if (r.consoleErrors !== 0) reasons.push(`${r.consoleErrors} console error(s)`);
-    if (!(r.fps > 55)) reasons.push(`fps ${r.fps} <= 55`);
-    if (r.canvas[0] !== W || r.canvas[1] !== H) reasons.push(`canvas ${r.canvas.join("x")} != ${W}x${H}`);
-    if (r.cssScale !== Math.floor(r.cssScale) || r.cssScale < 1) reasons.push(`non-integer css scale ${r.cssScale}`);
-    if (r.scene !== "field") reasons.push(`scene ${r.scene} != field`);
-    if (r.pixels.topLeft <= 0) reasons.push("no HUD pixels in top-left band");
-    // M1.5 feel assertions
-    if (!nearKilled) reasons.push("near target was not killed (kills did not increase)");
-    if (!(stats.kills >= 1)) reasons.push(`kills ${stats.kills} < 1`);
-    if (!(stats.hits >= 1)) reasons.push(`hits ${stats.hits} < 1`);
-    if (!(stats.freezes >= 1)) reasons.push(`freezes ${stats.freezes} < 1`);
-    if (!(stats.damageNumberPixels > 0)) reasons.push("no damage-number pixels on the canvas");
-    if (!sawInterrupt) reasons.push("no bite interrupted a wind-up (interrupt path not exercised)");
-    if (sawInterrupt && !followUpLanded) reasons.push("cast after bite interrupt did not land (stats.hits did not increase)");
-    // the shake must have fully released: renderer.setShake(0, 0) leaves no transform behind
-    if (renderer.canvas.style.transform !== "") reasons.push(`canvas transform "${renderer.canvas.style.transform}" not cleared`);
-
+    if (hard) clearTimeout(hard);
     const pass = reasons.length === 0;
     document.body.dataset.autotest = pass ? "pass" : "fail";
     document.body.dataset.autotestReason = pass ? "ok" : reasons.join("; ");
@@ -306,14 +318,239 @@ function runAutotest({ game, playground, renderer, stats, report }) {
         combo: stats.combo,
         bestCombo: stats.bestCombo,
         damageNumberPixels: stats.damageNumberPixels || 0,
+        numbersShown: stats.numbersShown || 0,
+        numbersCapped: stats.numbersCapped || 0,
+        maxNumbers: stats.maxNumbers || 0,
+        maxNumberBoxes: stats.maxNumberBoxes || 0,
+        killsByType: stats.killsByType || {},
+        deathFx: stats.deathFx || {},
       };
       window.__report.candle = game.snapshot(stats).candle;
       window.__report.autotest = {
         result: pass ? "pass" : "fail",
         reason: pass ? "ok" : reasons.join("; "),
-        nearTargetKilled: nearKilled,
-        castAfterInterrupt: followUpLanded,
+        flags,
       };
     }
-  }, 6500);
+  }
+
+  hard = setTimeout(() => {
+    finish([`autotest timed out after 50 s (scene ${game.scene}, phase ${game.player.phase})`]);
+  }, 50000);
+
+  (async () => {
+    try {
+      // --- M1.5 baseline: near kill, interrupt in the wind-up, next cast lands ----------
+      await sleep(400);
+      if (game.scene === "title") game.enterField();
+      await sleep(80);
+
+      const kills0 = stats.kills;
+      game.spawn("slime", 1, 160);
+      flags.nearKilled = await waitFor(
+        () => {
+          if (game.player.phase !== "idle") return false;
+          if (!castable[0]) startCast(0);
+          return stats.kills > kills0;
+        },
+        5000,
+      );
+
+      game.spawn("slime", 1, 124);
+      const interrupts0 = stats.interrupts || 0;
+      const ready = await waitFor(() => {
+        const s = alive("slime").find((e) => e.biteIn < 0.12);
+        return !!s && game.player.phase === "idle";
+      }, 5000);
+      if (ready) flags.hammerCast = startCast(1);
+      flags.sawInterrupt = flags.hammerCast && (await waitFor(() => (stats.interrupts || 0) > interrupts0, 2000));
+      if (flags.sawInterrupt) {
+        const hits0 = stats.hits;
+        flags.followUpCast = await waitFor(() => {
+          if (game.player.phase !== "idle") return false;
+          return startCast(0);
+        }, 2000);
+        if (flags.followUpCast) flags.followUpLanded = await waitFor(() => stats.hits > hits0, 2500);
+      }
+      await waitFor(() => alive().length === 0, 2500);
+
+      // --- frost nova: three slimes side by side, one cast, three numbers --------------
+      game.state.god = true;
+      await waitFor(() => game.player.phase === "idle", 2000);
+      const novaKills0 = stats.kills;
+      game.spawn("slime", 3, 180);
+      await sleep(40);
+      flags.novaCast = startCast(2);
+      await waitFor(() => stats.kills >= novaKills0 + 3, 3000, () => {
+        flags.maxNovaNumbers = Math.max(flags.maxNovaNumbers, game.combat.numberBoxes().length);
+      });
+      flags.novaKills = stats.kills - novaKills0;
+      if (game.player.phase === "cast") game.player.cancel("autotest");
+      await waitFor(() => game.player.phase === "idle", 1500);
+
+      // --- bolt: the farthest enemy is hit; an empty cast still plays out -------------
+      await waitFor(() => alive().length === 0, 2000);
+      const boltKills0 = stats.kills;
+      game.spawn("slime", 1, 350);
+      await sleep(40);
+      flags.boltCast = startCast(3);
+      flags.boltFarKill = await waitFor(() => stats.kills > boltKills0, 3000);
+      if (game.player.phase === "cast") game.player.cancel("autotest");
+      await waitFor(() => game.player.phase === "idle", 1500);
+
+      game.player.cooldowns[3] = 0; // test-only: the real cooldown was measured above; this one is the whiff
+      const whiffHits0 = stats.hits;
+      flags.whiffCast = startCast(3);
+      await sleep(1000);
+      flags.whiffPlaying = game.player.phase === "cast";
+      flags.whiffDone = await waitFor(() => game.player.phase === "idle", 3500);
+      flags.whiffNoHits = stats.hits === whiffHits0;
+
+      // --- poison: the slime loses hp in the cloud, the ghost walks through untouched --
+      await waitFor(() => alive().length === 0, 2000);
+      game.spawn("slime", 1, 220);
+      game.spawn("ghost", 1, 230);
+      await sleep(40);
+      const slime0 = alive("slime")[0];
+      const ghost0 = alive("ghost")[0];
+      const slimeHp0 = slime0 ? slime0.hp : -1;
+      const ghostHp0 = ghost0 ? ghost0.hp : -1;
+      flags.poisonCast = startCast(4);
+      flags.poisonCastPhase = game.player.phase; // "recover": a loop effect has no act
+      const hitsBeforePoison = stats.hits;
+      await sleep(2000);
+      const slimeNow = alive("slime")[0];
+      const ghostNow = alive("ghost")[0];
+      flags.poisonSlimeDamaged = !slimeNow || slimeNow.hp < slimeHp0;
+      flags.poisonGhostUnhurt = !!ghostNow && ghostNow.hp === ghostHp0;
+      flags.poisonTicks = stats.hits - hitsBeforePoison;
+
+      const ghostKills0 = stats.killsByType.ghost ?? 0;
+      for (let tries = 0; tries < 8 && alive("ghost").length; tries++) {
+        await waitFor(() => game.player.phase === "idle", 1500);
+        if (startCast(0)) await waitFor(() => alive("ghost").length === 0, 1800);
+        else await sleep(80);
+      }
+      flags.ghostKilled = (stats.killsByType.ghost ?? 0) > ghostKills0;
+
+      // --- heal: 50 -> 68, and never past the cap ------------------------------------
+      await waitFor(() => alive().length === 0, 2000);
+      await waitFor(() => game.player.phase === "idle", 1500);
+      game.state.candle = 50;
+      flags.healCast = startCast(5);
+      await sleep(60);
+      flags.healFrom50 = snap().candle;
+      if (game.player.phase === "cast") game.player.cancel("autotest");
+      await waitFor(() => game.player.phase === "idle", 1000);
+      game.state.candle = 95;
+      game.player.cooldowns[5] = 0; // test-only: the cap check is a second heal inside the 12 s cooldown
+      flags.healCapCast = startCast(5);
+      await sleep(60);
+      flags.healCap = snap().candle;
+      if (game.player.phase === "cast") game.player.cancel("autotest");
+      await waitFor(() => game.player.phase === "idle", 1000);
+
+      // --- every enemy type: spawn, correct hp/y, kill it with a real spell -----------
+      for (const type of ["slime", "ghost", "skull", "eyeball"]) {
+        await waitFor(() => alive().length === 0, 2000);
+        await waitFor(() => game.player.phase === "idle", 1500);
+        const killsBefore = stats.killsByType[type] ?? 0;
+        const n = game.spawn(type, 1, 150);
+        await sleep(40);
+        const info = snap().enemies.find((e) => e.type === type);
+        const rec = { spawned: n === 1 && !!info, hp: info ? info.hp : null, y: info ? info.y : null, killed: false, deathFx: null };
+        for (let tries = 0; tries < 8 && !rec.killed; tries++) {
+          await waitFor(() => game.player.phase === "idle", 1500);
+          if (startCast(0)) {
+            rec.killed = await waitFor(
+              () => alive(type).length === 0 && (stats.killsByType[type] ?? 0) > killsBefore,
+              1800,
+            );
+          } else await sleep(80);
+        }
+        rec.deathFx = stats.deathFx[type] ?? null;
+        flags.types[type] = rec;
+      }
+
+      // --- eight mixed bodies, one second of real frames -----------------------------
+      await waitFor(() => alive().length === 0, 2000);
+      await waitFor(() => game.player.phase === "idle", 1500);
+      const mix = ["slime", "ghost", "skull", "eyeball", "slime", "ghost", "skull", "eyeball"];
+      for (let i = 0; i < mix.length; i++) game.spawn(mix[i], 1, 200 + (i % 4) * 30);
+      await sleep(300);
+      flags.mixedAlive = alive().length;
+      await sleep(1600);
+      flags.mixedFps = stats.fps;
+      flags.mixedErrors = errors.length - errorsAtStart;
+
+      // --- final measured verdict ----------------------------------------------------
+      const r = report();
+      const reasons = [];
+      if (r.consoleErrors !== 0) reasons.push(`${r.consoleErrors} console error(s)`);
+      if (!(r.fps > 55)) reasons.push(`fps ${r.fps} <= 55`);
+      if (r.canvas[0] !== W || r.canvas[1] !== H) reasons.push(`canvas ${r.canvas.join("x")} != ${W}x${H}`);
+      if (r.cssScale !== Math.floor(r.cssScale) || r.cssScale < 1) reasons.push(`non-integer css scale ${r.cssScale}`);
+      if (r.scene !== "field") reasons.push(`scene ${r.scene} != field`);
+      if (r.pixels.topLeft <= 0) reasons.push("no HUD pixels in top-left band");
+      if (!(stats.kills >= 1)) reasons.push(`kills ${stats.kills} < 1`);
+      if (!(stats.hits >= 1)) reasons.push(`hits ${stats.hits} < 1`);
+      if (!(stats.freezes >= 1)) reasons.push(`freezes ${stats.freezes} < 1`);
+      if (!(stats.damageNumberPixels > 0)) reasons.push("no damage-number pixels on the canvas");
+      if (!flags.nearKilled) reasons.push("near target was not killed (kills did not increase)");
+      if (!flags.sawInterrupt) reasons.push("no bite interrupted a wind-up (interrupt path not exercised)");
+      if (!flags.followUpLanded) reasons.push("cast after bite interrupt did not land (stats.hits did not increase)");
+      if (!castable.every(Boolean)) reasons.push(`not every spell was cast: ${castable.map((v) => (v ? 1 : 0)).join("")}`);
+      const wantCost = [10, 22, 34, 30, 26, 40];
+      const wantCd = [0.6, 3, 8, 6, 7, 12];
+      for (let i = 0; i < 6; i++) {
+        if (costs[i] === null || Math.abs(costs[i] - wantCost[i]) > 0.01) {
+          reasons.push(`spell ${i + 1} cost ${costs[i]} != ${wantCost[i]}`);
+        }
+        if (!(cooldowns[i] > 0) || Math.abs(cooldowns[i] - wantCd[i]) > 0.01) {
+          reasons.push(`spell ${i + 1} cd ${cooldowns[i]} != ${wantCd[i]}`);
+        }
+      }
+      if (!(flags.novaKills >= 3)) reasons.push(`nova killed ${flags.novaKills} slimes, want 3`);
+      const novaNumbers = Math.max(flags.maxNovaNumbers || 0, stats.maxNumberBoxes || 0);
+      if (!(novaNumbers >= 3)) reasons.push(`nova showed ${novaNumbers} numbers on screen at once, want 3`);
+      if (!(stats.maxNumbers <= 4) || !(novaNumbers <= 4)) {
+        reasons.push(`too many concurrent numbers: push ${stats.maxNumbers}, screen ${novaNumbers} (max 4)`);
+      }
+      if (!flags.boltFarKill) reasons.push("bolt did not kill the farthest enemy");
+      if (!flags.whiffCast || !flags.whiffPlaying || !flags.whiffDone || !flags.whiffNoHits) {
+        reasons.push(
+          `bolt whiff did not perform cleanly (cast ${flags.whiffCast}, playing ${flags.whiffPlaying}, done ${flags.whiffDone}, noHits ${flags.whiffNoHits})`,
+        );
+      }
+      if (!flags.poisonSlimeDamaged) reasons.push("poison did not damage the slime");
+      if (!flags.poisonGhostUnhurt) reasons.push("ghost was damaged by poison (should be immune)");
+      if (!(flags.poisonTicks >= 1)) reasons.push("poison produced no ticks");
+      if (flags.poisonCastPhase !== "recover") reasons.push(`poison cast phase ${flags.poisonCastPhase} != recover`);
+      if (flags.healFrom50 !== 68) reasons.push(`heal 50 -> ${flags.healFrom50}, want 68`);
+      if (flags.healCap !== 100) reasons.push(`heal at 95 -> ${flags.healCap}, want 100 (cap)`);
+      const wantHp = { slime: 30, ghost: 20, skull: 20, eyeball: 50 };
+      const wantY = { slime: 196, ghost: 196, skull: 170, eyeball: 196 };
+      for (const type of ["slime", "ghost", "skull", "eyeball"]) {
+        const t = flags.types[type] || {};
+        if (!t.spawned) reasons.push(`${type} did not spawn`);
+        if (t.hp !== wantHp[type]) reasons.push(`${type} hp ${t.hp} != ${wantHp[type]}`);
+        if (t.y !== wantY[type]) reasons.push(`${type} y ${t.y} != ${wantY[type]}`);
+        if (!t.killed) reasons.push(`${type} was not killed`);
+      }
+      if (flags.types.eyeball && flags.types.eyeball.deathFx !== "spawn/disintegrate") {
+        reasons.push(`eyeball death fx ${flags.types.eyeball.deathFx}`);
+      }
+      if (flags.mixedAlive !== 8) reasons.push(`mixed field had ${flags.mixedAlive} bodies, want 8`);
+      if (!(flags.mixedFps > 55)) reasons.push(`mixed field fps ${flags.mixedFps} <= 55`);
+      const finalSnap = snap();
+      if (finalSnap.cooldowns.length !== 6) reasons.push(`cooldowns length ${finalSnap.cooldowns.length} != 6`);
+      if (!finalSnap.enemies.every((e) => typeof e.y === "number")) reasons.push("snapshot enemies missing y");
+      if (renderer.canvas.style.transform !== "") reasons.push(`canvas transform "${renderer.canvas.style.transform}" not cleared`);
+
+      finish(reasons);
+    } catch (err) {
+      console.error(err);
+      finish([`autotest threw: ${err instanceof Error ? err.message : String(err)}`]);
+    }
+  })();
 }

@@ -1,41 +1,94 @@
-// M1 has one enemy: the slime. It walks the ground line in from the right, stops at its place in the queue
-// in front of the player and bites the candle. It does not move by animation: the effect animates in place
-// and the body is moved by rewriting x.
+// The four enemy types of M2a, as one parameterised body: same walk/queue/bite/flash/death machinery, different
+// numbers and effect. An enemy does not animate its own movement: the critter effect loops in place and the body
+// is moved by rewriting x (the flying lane also owns a y).
 import { createFx } from "../../vendor/pixelfx/src/core/index.js";
 import * as slimeFx from "../../vendor/pixelfx/src/fx/critters/slime.js";
-import { W } from "../frame.js";
+import * as ghostFx from "../../vendor/pixelfx/src/fx/critters/ghost.js";
+import * as skullFx from "../../vendor/pixelfx/src/fx/critters/flying-skull.js";
+import * as eyeballFx from "../../vendor/pixelfx/src/fx/critters/eyeball.js";
+import { W, GROUND } from "../frame.js";
 
-export const SLIME = "slime";
-export const SLIME_SPEED = 18; // px/s
 export const SPAWN_X = 384; // just off the right edge
 export const GUARD_X = 124; // the front of the queue: close enough to bite, far enough not to swallow the player
-export const QUEUE_GAP = 34; // px between two waiting slimes (DESIGN §2.3)
-export const BITE_DAMAGE = 3;
-export const BITE_INTERVAL = 0.6;
-export const SLIME_HP = 30; // DESIGN §2.7 (the M1 "3" column is this ×10, see M1 findings)
+export const QUEUE_GAP = 34; // px between two waiting enemies in the same lane (DESIGN §2.3)
+export const FLY_Y = GROUND - 26; // the flying lane (M2a brief); only flyers queue here
+
+/** DESIGN §2.7 / the M2a brief. `hitY` is measured from the enemy's own lane y. */
+export const ENEMY_TYPES = {
+  slime: {
+    fx: slimeFx,
+    hp: 30,
+    speed: 18,
+    bite: 3,
+    interval: 0.6,
+    deathFx: "spawn/poof",
+    hitY: -16,
+  },
+  ghost: {
+    fx: ghostFx,
+    hp: 20,
+    speed: 30,
+    bite: 3,
+    interval: 0.6,
+    poisonImmune: true,
+    deathFx: "spawn/poof",
+    hitY: -22,
+  },
+  skull: {
+    fx: skullFx,
+    hp: 20,
+    speed: 55,
+    bite: 5,
+    interval: 0.5,
+    flying: true,
+    interruptPriority: true, // this one rushes its bite when a wind-up starts
+    deathFx: "spawn/poof",
+    hitY: 0,
+  },
+  eyeball: {
+    fx: eyeballFx,
+    hp: 50,
+    speed: 22,
+    bite: 12,
+    interval: 1.2,
+    deathFx: "spawn/disintegrate", // DESIGN §2.7: the thick one comes apart instead of popping
+    hitY: -44,
+  },
+};
+
 const PUSH_TIME = 0.14; // seconds to travel the knockback distance, whatever it is
 const HIT_FLASH = 0.08;
-const MAX_X = W - 16; // the knockback stops here, so a slime can never leave the screen
+const MAX_X = W - 16; // the knockback stops here, so an enemy can never leave the screen
 const FLASH_RAMP = ["#e8f2ff", "#ffffff"];
 const LUNGE = 8; // the bite leans in this far, then comes back (visual only)
 const LUNGE_TIME = 0.16;
+const SKULL_RUSH = 0.15; // a skull at the line bites this soon after a wind-up begins
 
-export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, world }) {
-  const fx = createFx(slimeFx, { x, y, seed });
-  // The same slime again in white: drawn over the real one for a few frames when it is hit (DESIGN §2.11).
+export function createEnemy({ x = SPAWN_X, y, seed = 1, type = "slime", world }) {
+  const T = ENEMY_TYPES[type] ?? ENEMY_TYPES.slime;
+  const laneY = y ?? (T.flying ? FLY_Y : GROUND);
+  // A flyer's effect is still anchored to the floor (its own shadow and fire must sit on the floor), and its
+  // internal hover carries the body up to the lane: hover 26 puts the skull at y, not at GROUND.
+  const fxOptions = { x, y: T.flying ? GROUND : laneY, seed };
+  if (T.flying) fxOptions.hover = GROUND - laneY;
+  const fx = createFx(T.fx, fxOptions);
+  // The same creature again in white: drawn over the real one for a few frames when it is hit (DESIGN §2.11).
   // Same seed and same step sequence, so the two stay in the same pose.
-  const flash = createFx(slimeFx, { x, y, seed, palette: FLASH_RAMP });
+  const flash = createFx(T.fx, { ...fxOptions, palette: FLASH_RAMP });
 
   let posX = x;
-  let hp = SLIME_HP;
-  let biteT = BITE_INTERVAL;
+  let hp = T.hp;
+  let biteT = T.interval;
   let pushV = 0;
   let pushT = 0;
   let hurtT = 0;
   let lungeT = 0;
+  let slowT = 0;
+  let slowMult = 1;
   let dead = false;
   let stopX = GUARD_X; // its place in the queue, assigned by the field every step
-  let front = false; // only the slime at the guard line can reach the player
+  let front = false; // only the front of its own lane can reach the player
+  let rushedCast = -1; // the last player cast this skull already rushed a bite for
 
   function bite() {
     const p = world.player;
@@ -43,7 +96,7 @@ export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, worl
     world.combat.hit({
       x: p.x + 7,
       y: p.y - 22,
-      damage: BITE_DAMAGE,
+      damage: T.bite,
       target: p, // player.hurt drains the candle, makes him flinch and (only in the wind-up) breaks the cast
       shake: 0.12,
       amp: 1,
@@ -56,22 +109,34 @@ export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, worl
     if (dead) return; // it may still be on the field for the one frame the world stays frozen after the kill
     if (hurtT > 0) hurtT = Math.max(0, hurtT - dt);
     if (lungeT > 0) lungeT = Math.max(0, lungeT - dt);
+    if (slowT > 0) {
+      slowT = Math.max(0, slowT - dt);
+      if (slowT === 0) slowMult = 1;
+    }
     if (pushT > 0) {
       // knockback travels exactly `knock` px (speed fixed at the moment of the hit), then walking resumes
       const step = Math.min(dt, pushT);
       posX = Math.min(MAX_X, posX + pushV * step);
       pushT -= step;
     } else {
-      // walk to the slot assigned this step; queued slimes wait without biting, so a crowd cannot lock the player
+      // walk to the slot assigned this step; queued enemies wait without biting, so a crowd cannot lock the player
       const gap = posX - stopX;
-      if (gap > 0.5) posX = Math.max(stopX, posX - SLIME_SPEED * dt);
-      else if (gap < -0.5) posX = Math.min(stopX, posX + SLIME_SPEED * dt);
+      const speed = T.speed * (slowT > 0 ? slowMult : 1);
+      if (gap > 0.5) posX = Math.max(stopX, posX - speed * dt);
+      else if (gap < -0.5) posX = Math.min(stopX, posX + speed * dt);
       else {
         posX = stopX;
         if (front) {
+          // a skull is the interrupter: when a wind-up starts, it rushes its next bite (once per cast).
+          // Everyone else simply keeps their cadence; their bite only lands when they are at the line anyway.
+          const p = world.player;
+          if (T.interruptPriority && p && p.windup && p.castSeq !== rushedCast) {
+            rushedCast = p.castSeq;
+            biteT = Math.min(biteT, SKULL_RUSH);
+          }
           biteT -= dt;
           if (biteT <= 0) {
-            biteT += BITE_INTERVAL;
+            biteT += T.interval;
             bite();
           }
         }
@@ -85,13 +150,20 @@ export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, worl
     flash.update(dt);
   }
 
-  /** The field assigns one queue slot per slime each step: GUARD_X + 34 * (how many are in front of it). */
+  /** The field assigns one queue slot per enemy each step: GUARD_X + 34 * (how many are in front in its lane). */
   function place(x, isFront) {
     stopX = x;
     front = isFront;
   }
 
-  /** Called by combat.hit: everything that happens to this slime when it is struck. */
+  /** Frost nova's slow: a movement multiplier for `time` seconds. Hit tests stay exactly where they were. */
+  function slow(mult = 0.5, time = 3) {
+    if (dead || time <= 0) return;
+    slowT = Math.max(slowT, time);
+    slowMult = Math.min(slowT > 0 ? slowMult : 1, mult);
+  }
+
+  /** Called by combat.hit: everything that happens to this enemy when it is struck. */
   function hurt(damage, knock = 0) {
     if (dead) return;
     hp -= damage;
@@ -102,9 +174,9 @@ export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, worl
     }
     if (hp <= 0) {
       dead = true;
-      // the death itself: a cartoon poof at its feet and the ember it leaves behind
-      world.combat.effect("spawn/poof", posX, y, seed + 3);
-      world.combat.effect("pickups/collect-burst", posX, y - 4, seed + 5);
+      // the death itself: its own effect at its body, and the ember it leaves behind
+      world.combat.effect(T.deathFx, posX, laneY, seed + 3);
+      world.combat.effect("pickups/collect-burst", posX, laneY - 4, seed + 5);
       world.onKill?.(enemy);
     }
   }
@@ -123,13 +195,14 @@ export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, worl
     id: seed,
     update,
     hurt,
+    slow,
     draw,
     place,
     get x() {
       return posX;
     },
     get y() {
-      return y;
+      return laneY;
     },
     get hp() {
       return Math.max(0, hp);
@@ -137,7 +210,23 @@ export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, worl
     get dead() {
       return dead;
     },
-    /** Debug/autotest only: seconds until this slime's next bite, Infinity when it is not the front one. */
+    get flying() {
+      return !!T.flying;
+    },
+    get poisonImmune() {
+      return !!T.poisonImmune;
+    },
+    get deathFx() {
+      return T.deathFx;
+    },
+    /** Current movement speed in px/s (after a slow); debug/verification only. */
+    get speed() {
+      return T.speed * (slowT > 0 ? slowMult : 1);
+    },
+    get slowT() {
+      return slowT;
+    },
+    /** Debug/autotest only: seconds until this enemy's next bite, Infinity when it is not the front of its lane. */
     get biteIn() {
       return front && Math.abs(posX - stopX) <= 0.5 ? biteT : Infinity;
     },
@@ -145,7 +234,7 @@ export function createEnemy({ x = SPAWN_X, y = 196, seed = 1, type = SLIME, worl
       return posX;
     },
     get hitY() {
-      return y - 16;
+      return laneY + T.hitY;
     },
   };
   return enemy;

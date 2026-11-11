@@ -21,7 +21,16 @@ export const INTERRUPT_ARMOR = 1.0; // after one interrupt the next bite cannot 
 const BITE_FLASH = 0.18; // the candle bar's red blink when a bite lands (HUD reads state.biteFlash)
 const OUTLINE = hex("#050912");
 
-export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTarget = null, stats = {} }) {
+export function createPlayer({
+  x = PLAYER_X,
+  y = PLAYER_Y,
+  state,
+  combat,
+  findTarget = null, // the frontmost single target for this spell (reach is the spell's business)
+  findTargets = null, // every living target for an AoE
+  onCast = null, // field hook for spells with no act (the poison zone)
+  stats = {},
+}) {
   // The acts are authored on the 2x actor (meta.actor = 2), so the idle body is that same character:
   // otherwise he would double in size the moment he starts casting.
   const body = stockActor(2);
@@ -34,6 +43,7 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
   let recoverT = 0;
   let nextHit = 0;
   let seed = 0;
+  let castSeq = 0; // bumped on every accepted cast; a skull watches this to rush an interrupt
   let reactT = 0; // the flinch after being bitten
   let armorT = 0; // grace period after an interrupt: bites still hurt, but cannot cancel
   let clock = 0;
@@ -49,7 +59,27 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
     cooldowns[index] = sp.cd;
     spell = index;
     nextHit = 0;
-    act = createAct(sp.fx, { x, y, seed: ++seed });
+    castSeq++;
+
+    if (sp.kind === "zone") {
+      // A loop effect has no act to perform; the brief gives it a 0.3 s recovery instead. The field owns the
+      // cloud's lifetime and ticks (see game.js), so the cast is complete the moment it is placed.
+      act = null;
+      phase = "recover";
+      recoverT = sp.recovery ?? 0.3;
+      onCast?.(sp, index);
+      return true;
+    }
+
+    if (sp.kind === "heal") {
+      // The candle is the whole heal: applied on the cast, capped, and deliberately unable to overflow.
+      state.candle = Math.min(state.maxCandle, state.candle + (sp.heal ?? 0));
+    }
+
+    // Bolt has to know where to put its strike before the act exists; every other act already knows.
+    const target = sp.makeFx && findTarget ? findTarget(sp) : null;
+    const mod = sp.makeFx ? sp.makeFx(x, target) : sp.fx;
+    act = createAct(mod, { x, y, seed: ++seed });
     phase = "cast";
     return true;
   }
@@ -91,29 +121,54 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
   }
 
   /**
-   * Fire damage on the act's own hit windows, once each, on the frontmost enemy in reach. `strikes` is the
-   * number of blows the spell lands inside one window (DESIGN §2.6's two sword cuts); they share the act's
-   * single window and are resolved as one impact, so one cast still shows one number and one spark.
+   * Fire damage on the act's first hit window, once. Single spells resolve the frontmost target in reach;
+   * an AoE resolves every living enemy, each with its own spark and number but one screen-wide freeze/flash.
+   * `strikes` is the number of blows the spell lands inside that one window (DESIGN §2.6's two sword cuts):
+   * they share the window and are resolved as one impact, so one cast still shows one number and one spark.
    */
   function resolveHits() {
     const sp = SPELLS[spell];
-    const hits = timings[spell]?.hits ?? [];
-    const damage = sp.damage * Math.max(1, sp.strikes ?? 1);
-    while (nextHit < hits.length && act.t >= hits[nextHit].t) {
-      const h = hits[nextHit++];
-      const target = findTarget ? findTarget(sp) : null;
-      if (!target) continue; // nothing in reach: the act's own dust and sparks are the miss feedback
-      combat.hit({
-        x: target.hitX,
-        y: target.hitY,
-        damage,
-        knock: sp.knock,
-        target,
-        freeze: h.freeze,
-        shake: h.shake,
-        amp: h.amp,
-      });
+    if (!sp) return;
+    const hit = timings[spell]?.hits?.[0];
+    if (!hit || nextHit > 0) return;
+    if (act.t < hit.t) return;
+    nextHit = 1; // one damage window per cast, however many targets it reaches
+
+    if (sp.kind === "aoe") {
+      const targets = findTargets ? findTargets(sp) : [];
+      for (let i = 0; i < targets.length; i++) {
+        const t = targets[i];
+        combat.hit({
+          x: t.hitX,
+          y: t.hitY,
+          damage: sp.damage,
+          target: t,
+          // one hit-stop, one shake, one white flash for the spell; every target still gets its spark + number
+          freeze: i === 0 ? hit.freeze : 0,
+          shake: i === 0 ? hit.shake : 0,
+          amp: i === 0 ? hit.amp : 0,
+          screen: i === 0,
+          count: i === 0,
+        });
+        if (sp.slow) t.slow?.(sp.slow.mult, sp.slow.time);
+      }
+      return;
     }
+
+    if (sp.kind !== "single") return;
+    const target = findTarget ? findTarget(sp) : null;
+    if (!target) return; // nothing in reach: the act's own dust and sparks are the miss feedback
+    const damage = sp.damage * Math.max(1, sp.strikes ?? 1);
+    combat.hit({
+      x: target.hitX,
+      y: target.hitY,
+      damage,
+      knock: sp.knock ?? 0,
+      target,
+      freeze: hit.freeze,
+      shake: hit.shake,
+      amp: hit.amp,
+    });
   }
 
   function update(dt, frozen = false) {
@@ -184,6 +239,15 @@ export function createPlayer({ x = PLAYER_X, y = PLAYER_Y, state, combat, findTa
     },
     get mana() {
       return state.mana;
+    },
+    /** True while a cast is still before its first hit window: the only time a bite can cut it. */
+    get windup() {
+      if (phase !== "cast" || !act) return false;
+      const first = timings[spell]?.hits?.[0]?.t ?? 0;
+      return act.t < first;
+    },
+    get castSeq() {
+      return castSeq;
     },
   };
 }

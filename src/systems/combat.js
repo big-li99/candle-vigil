@@ -10,6 +10,7 @@ export const NUMBER_FILL = hex("#fff3a6");
 const NUMBER_OUTLINE = hex("#05070d");
 const NUMBER_LIFE = 0.6;
 const NUMBER_RISE = 11; // world px over the number's life
+const MAX_NUMBERS = 4; // concurrent rising numbers; past this, a hit only sparks (M2a brief)
 const FLASH_TIME = 1 / 60; // exactly the hit frame
 const COMBO_HOLD = 2; // seconds without a hit before the combo resets
 
@@ -18,9 +19,12 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
   stats.freezes ??= 0;
   stats.combo ??= 0;
   stats.bestCombo ??= 0;
+  stats.numbersShown ??= 0;
+  stats.numbersCapped ??= 0;
+  stats.maxNumbers ??= 0;
   const shakeOf = renderer && typeof renderer.setShake === "function" ? renderer : { setShake() {} };
 
-  const effects = [];
+  const effects = []; // { inst, layer }; layer "back" is drawn under the enemies (poison cloud)
   const numbers = [];
   let boxes = [];
   let freeze = 0;
@@ -33,12 +37,16 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
   let seed = 0;
   let lastShake = "";
 
-  /** A one-shot effect owned by combat (impact spark, death poof, pickup burst). */
-  function effect(id, x, y, seedIn) {
+  /**
+   * A one-shot or looping effect owned by combat (impact spark, death poof, pickup burst, poison cloud).
+   * `layer: "back"` means it is drawn before the enemies (ground effects); the default is the impact layer,
+   * drawn over them with the numbers.
+   */
+  function effect(id, x, y, seedIn, { layer = "front" } = {}) {
     const mod = getAsset(id);
     if (!mod) return null;
     const inst = createFx(mod, { x, y, seed: seedIn || ++seed });
-    effects.push(inst);
+    effects.push({ inst, layer });
     return inst;
   }
 
@@ -48,6 +56,8 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
    *
    * `fxImpacts: false` is the one small switch for a hit that is not an impact (enemy bites): it still damages
    * the target and shakes the screen, but leaves no spark, number, white flash, freeze, hit stat or combo.
+   * `screen: false` keeps the spark and the number but skips the global freeze and white flash — the extra
+   * targets of an AoE, and every poison tick, must not each stop the world.
    */
   function hit({
     x = 0,
@@ -60,6 +70,7 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     amp = 0,
     count = true,
     fxImpacts = true,
+    screen = true,
   } = {}) {
     target?.hurt?.(damage, knock);
 
@@ -70,13 +81,22 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     }
     if (!fxImpacts) return; // a bite's feedback is the shake it just set, the candle flash and the flinch
 
-    freeze = Math.max(freeze, Math.min(HIT_FREEZE_MAX, Math.max(HIT_FREEZE_MIN, fz)));
+    if (screen) {
+      freeze = Math.max(freeze, Math.min(HIT_FREEZE_MAX, Math.max(HIT_FREEZE_MIN, fz)));
+      stats.freezes++;
+      flashT = FLASH_TIME;
+    }
     stats.hits++;
-    stats.freezes++;
-    flashT = FLASH_TIME;
     effect("impacts/hit-spark", x, y);
-    // the number starts above the impact so it never sits on top of the enemy's own hit flash
-    numbers.push({ x, y: y - 12, damage, t: 0 });
+    // the number starts above the impact so it never sits on top of the enemy's own hit flash.
+    // No more than four at once: a fifth simultaneous hit keeps its spark but does not add to the mush.
+    if (numbers.length < MAX_NUMBERS) {
+      numbers.push({ x, y: y - 12, damage, t: 0 });
+      stats.numbersShown++;
+      stats.maxNumbers = Math.max(stats.maxNumbers, numbers.length);
+    } else {
+      stats.numbersCapped++;
+    }
     if (count) {
       combo++;
       comboT = COMBO_HOLD;
@@ -117,19 +137,30 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     for (let i = numbers.length - 1; i >= 0; i--) if (numbers[i].t >= NUMBER_LIFE) numbers.splice(i, 1);
     if (!frozen) {
       for (let i = effects.length - 1; i >= 0; i--) {
-        effects[i].update(dt);
-        if (effects[i].done()) effects.splice(i, 1);
+        effects[i].inst.update(dt);
+        if (effects[i].inst.done()) effects.splice(i, 1);
       }
     }
     applyShake();
   }
 
+  /** Effects on one layer, each in both of its own sub-layers. */
+  function drawEffects(frame, layer) {
+    for (const e of effects) {
+      if (e.layer !== layer) continue;
+      e.inst.draw(frame, "back");
+      e.inst.draw(frame, "front");
+    }
+  }
+
+  /** Ground effects (the poison cloud) go under the enemies; call this before they are drawn. */
+  function drawBack(frame) {
+    drawEffects(frame, "back");
+  }
+
   /** Impact effects first, then the numbers, always with a painter fetched after the effects placed theirs. */
   function draw(frame) {
-    for (const inst of effects) {
-      inst.draw(frame, "back");
-      inst.draw(frame, "front");
-    }
+    drawEffects(frame, "front");
     const p = painterFor(frame);
     boxes = [];
     for (const n of numbers) {
@@ -154,6 +185,7 @@ export function createCombat({ renderer = null, stats = {} } = {}) {
     effect,
     update,
     draw,
+    drawBack,
     drawFlash,
     numberBoxes: () => boxes,
     effectCount: () => effects.length,

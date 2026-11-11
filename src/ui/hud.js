@@ -23,14 +23,18 @@ const C = {
   manaEmpty: hex("#131a2e"),
   slotEdge: hex("#2a4166"),
   slotSide: hex("#16243a"),
+  slotCoolEdge: hex("#111a29"), // cooling down: the border goes dark
+  slotCoolSide: hex("#0b111c"),
+  dangerEdge: hex("#ff6a5a"), // not enough mana: the border goes red
+  dangerSide: hex("#7a2a24"),
   keyPlate: hex("#05070d"),
   wipe: hex("#05070d"),
+  plateBase: hex("#060a12"),
 };
 
-const SLOT_W = 42;
+const MARGIN = 6;
 const SLOT_H = 18;
-const GAP = 4;
-const SLOTS_X = 6;
+const GAP = 3;
 const SLOTS_Y = 196;
 const THUMB_W = 40;
 const THUMB_H = 16;
@@ -137,39 +141,59 @@ export function drawHud(frame, state, run = {}) {
   p.rect(barX, barY, Math.round(barW * candleFill), barH, bitten || low ? C.dangerBar : C.warmBar);
   p.text(String(Math.round(state.candle)), 6 + plateW - 6, 18, bitten || low ? C.danger : C.warm, { font: "mini", align: "right" });
 
-  // --- bottom row: four slots (1–2 bound) + mana, on the floor strip -----------------
-  clearLight(p, 0, SLOTS_Y, W, H - SLOTS_Y);
-  for (let i = 0; i < 4; i++) {
-    const x = SLOTS_X + i * (SLOT_W + GAP);
-    const y = SLOTS_Y;
-    p.rect(x, y, SLOT_W, SLOT_H, C.plate, 0.94);
-    p.rect(x, y, SLOT_W, 1, C.slotEdge);
-    p.rect(x, y + SLOT_H - 1, SLOT_W, 1, C.plateShade);
-    p.rect(x, y, 1, SLOT_H, C.slotSide);
-    p.rect(x + SLOT_W - 1, y, 1, SLOT_H, C.slotSide);
+  // --- bottom row: six slots + mana, on one dark plate --------------------------------
+  // Six slots always exist (no unlock system). The widths are laid out from the mana panel's measured label,
+  // so the whole row fits 384 px without the icons shrinking below their 40 px thumbnail.
+  const n = spells.length;
+  const manaWanted = Math.max(74, p.measure(`MANA ${state.maxMana}`, { font: "mini" })[0] + 8);
+  const slotW = Math.max(
+    40,
+    Math.min(46, Math.floor((W - MARGIN * 2 - GAP - manaWanted - GAP * (n - 1)) / Math.max(1, n))),
+  );
+  const slotsW = n * slotW + Math.max(0, n - 1) * GAP;
+  const manaX = MARGIN + slotsW + GAP;
+  const manaW = W - manaX - MARGIN;
 
+  clearLight(p, 0, SLOTS_Y - 1, W, H - (SLOTS_Y - 1));
+  p.rect(0, SLOTS_Y - 1, W, H - (SLOTS_Y - 1), C.plateBase, 0.96);
+  p.rect(0, SLOTS_Y - 1, W, 1, C.plateEdge);
+
+  for (let i = 0; i < n; i++) {
+    const x = MARGIN + i * (slotW + GAP);
+    const y = SLOTS_Y;
     const spell = spells[i];
+    const cd = cooldowns[i] ?? 0;
+    // "why can't I press it": cooling down = a dark rim, short of mana = a red rim
+    const cooling = cd > 0;
+    const lowMana = !!spell && state.mana < spell.cost;
+    const edge = cooling ? C.slotCoolEdge : lowMana ? C.dangerEdge : C.slotEdge;
+    const side = cooling ? C.slotCoolSide : lowMana ? C.dangerSide : C.slotSide;
+
+    p.rect(x, y, slotW, SLOT_H, C.plate, 0.96);
+    p.rect(x, y, slotW, 1, edge);
+    p.rect(x, y + SLOT_H - 1, slotW, 1, edge);
+    p.rect(x, y, 1, SLOT_H, side);
+    p.rect(x + slotW - 1, y, 1, SLOT_H, side);
+
     if (spell) {
-      blit(p, thumbFor(spell), THUMB_W, THUMB_H, x + 1, y + 1);
+      const thumbX = x + Math.floor((slotW - THUMB_W) / 2);
+      blit(p, thumbFor(spell), THUMB_W, THUMB_H, thumbX, y + 1);
       // cooldown wipe: a dark curtain over the icon that shrinks away as the spell comes back
-      const cd = cooldowns[i] ?? 0;
-      if (cd > 0 && spell.cd > 0) {
+      if (cooling && spell.cd > 0) {
         const h = Math.round(THUMB_H * Math.max(0, Math.min(1, cd / spell.cd)));
-        if (h > 0) p.rect(x + 1, y + 1, THUMB_W, h, C.wipe, 0.78);
+        if (h > 0) p.rect(thumbX, y + 1, THUMB_W, h, C.wipe, 0.78);
       }
     }
 
-    // the key number on a dark chip, so it reads over the icon
+    // the key number on a dark chip, so it reads over the icon (drawn after the wipe, always legible)
     p.rect(x + 1, y + 1, 8, 8, C.keyPlate, 0.9);
-    p.text(String(i + 1), x + 5, y + 2, spell ? C.text : C.textDim, { font: "mini" });
+    p.text(String(i + 1), x + 4, y + 2, spell ? C.text : C.textDim, { font: "mini" });
   }
 
   // --- bottom-right: mana -----------------------------------------------------------
-  const manaX = SLOTS_X + 4 * SLOT_W + 3 * GAP + 4;
-  const manaW = W - manaX - 6;
   const manaY = SLOTS_Y;
   const manaH = SLOT_H;
-  p.rect(manaX, manaY, manaW, manaH, C.plate, 0.94);
+  p.rect(manaX, manaY, manaW, manaH, C.plate, 0.96);
   p.rect(manaX, manaY, manaW, 1, C.slotEdge);
   p.rect(manaX, manaY + manaH - 1, manaW, 1, C.plateShade);
 
